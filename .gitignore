@@ -19,3 +19,6 @@ venv/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Ignored folders
+supporting_files/
