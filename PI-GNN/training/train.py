@@ -14,12 +14,11 @@ def train_model():
     # Paths to the actual output data
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../model_io'))
     f14 = os.path.join(base_dir, 'fort.14')
+    f22 = os.path.join(base_dir, 'fort.22')
     f63 = os.path.join(base_dir, 'fort.63.nc')
-    f73 = os.path.join(base_dir, 'fort.73.nc')
-    f74 = os.path.join(base_dir, 'fort.74.nc') # Wind velocity
-
+    
     # Check if files exist
-    for f in [f14, f63]:
+    for f in [f14, f22, f63]:
         if not os.path.exists(f):
             print(f"CRITICAL ERROR: {f} not found!")
             return
@@ -30,9 +29,9 @@ def train_model():
     window_size = 6  # Look back 6 time steps
     horizon = 1      # Predict 1 time step ahead
     
-    print("1. Compiling Dataset from netCDF files (Full Storm Dataset)...")
+    print("1. Compiling Dataset from fort.22 Track and fort.14 Mesh...")
     # This processes the actual massive datasets
-    dataset = create_sequence_dataset(f14, f63, f73, f74, window_size=window_size, horizon=horizon)
+    dataset, open_boundary_nodes = create_sequence_dataset(f14, f22, f63, window_size=window_size, horizon=horizon)
     
     # Split into Train (80%) and Val (20%) sequences
     train_size = int(0.8 * len(dataset))
@@ -43,9 +42,9 @@ def train_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"2. Initializing Model on {device}...")
     
-    # Features = 5 (Depth, Zeta, Pressure, WindX, WindY)
+    # Features = 4 (Depth, Dist_to_Eye, Vmax, Pc)
     num_nodes = dataset[0].x.size(0)
-    model = SpatioTemporalGNN(num_nodes=num_nodes, num_features=5, window_size=window_size).to(device)
+    model = SpatioTemporalGNN(num_nodes=num_nodes, num_features=4, window_size=window_size).to(device)
     
     optimizer = Adam(model.parameters(), lr=learning_rate)
     criterion = torch.nn.MSELoss()
