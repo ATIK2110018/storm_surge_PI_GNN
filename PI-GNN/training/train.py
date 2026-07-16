@@ -46,6 +46,11 @@ def train_model():
     num_nodes = dataset[0].x.size(0)
     model = SpatioTemporalGNN(num_nodes=num_nodes, num_features=4, window_size=window_size).to(device)
     
+    # Utilize Multi-GPU if available (Kaggle T4 x2)
+    if torch.cuda.device_count() > 1:
+        print(f"   => Leveraging {torch.cuda.device_count()} GPUs with DataParallel!")
+        model = torch.nn.DataParallel(model)
+    
     optimizer = Adam(model.parameters(), lr=learning_rate)
     criterion = torch.nn.MSELoss()
     
@@ -86,7 +91,11 @@ def train_model():
         print(f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss/len(train_dataset):.4f} | Val Loss: {val_loss/len(val_dataset):.4f}")
         
     print("Training Complete. Saving model...")
-    torch.save(model.state_dict(), os.path.join(os.path.dirname(__file__), 'pi_gnn_model.pth'))
+    # Strip the DataParallel 'module.' prefix before saving if multiple GPUs were used
+    if isinstance(model, torch.nn.DataParallel):
+        torch.save(model.module.state_dict(), os.path.join(os.path.dirname(__file__), 'pi_gnn_model.pth'))
+    else:
+        torch.save(model.state_dict(), os.path.join(os.path.dirname(__file__), 'pi_gnn_model.pth'))
     print("Model saved to PI-GNN/training/pi_gnn_model.pth")
 
 if __name__ == "__main__":
