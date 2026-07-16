@@ -3,7 +3,76 @@ import numpy as np
 import torch
 import netCDF4 as nc
 import datetime
+import math
 from torch_geometric.data import Data
+
+def generate_boundary_tides(f15, f63, open_boundary_nodes):
+    """
+    Synthesizes exact Astronomical Tides from the fort.15 input file parameters.
+    No data leakage from fort.63 water levels is used!
+    """
+    print("Synthesizing Astronomical Tides from fort.15 Inputs...")
+    ds63 = nc.Dataset(f63)
+    t_seconds = ds63.variables['time'][:] # Get the exact simulation time in seconds
+    ds63.close()
+    
+    time_steps = len(t_seconds)
+    num_bnodes = len(open_boundary_nodes)
+    boundary_tides = np.zeros((time_steps, num_bnodes))
+    
+    with open(f15, 'r') as f:
+        lines = f.readlines()
+        
+    nbfr = 0
+    start_idx = 0
+    for i, line in enumerate(lines):
+        if 'NBFR' in line:
+            nbfr = int(line.split()[0])
+            start_idx = i + 1
+            break
+            
+    freqs = []
+    idx = start_idx
+    for k in range(nbfr):
+        name = lines[idx].strip()
+        idx += 1
+        parts = lines[idx].split()
+        freqs.append({
+            'name': name,
+            'amigt': float(parts[0]),
+            'fft': float(parts[1]),
+            'facet': float(parts[2])
+        })
+        idx += 1
+        
+    for k in range(nbfr):
+        idx += 1 # Skip Name
+        emo = np.zeros(num_bnodes)
+        efa = np.zeros(num_bnodes)
+        for j in range(num_bnodes):
+            parts = lines[idx].split()
+            emo[j] = float(parts[0])
+            efa[j] = float(parts[1])
+            idx += 1
+        freqs[k]['emo'] = emo
+        freqs[k]['efa'] = efa
+        
+    for t_idx in range(time_steps):
+        t = t_seconds[t_idx]
+        zeta = np.zeros(num_bnodes)
+        for k in range(nbfr):
+            amigt = freqs[k]['amigt']
+            fft = freqs[k]['fft']
+            facet = freqs[k]['facet']
+            emo = freqs[k]['emo']
+            efa = freqs[k]['efa']
+            
+            phase = (math.pi / 180.0) * (facet - efa)
+            zeta += fft * emo * np.cos(amigt * t + phase)
+            
+        boundary_tides[t_idx, :] = zeta
+        
+    return torch.tensor(boundary_tides, dtype=torch.float32)
 
 def load_adcirc_mesh(fort14_path):
     print("Parsing fort.14 (ADCIRC Mesh)...")
@@ -166,4 +235,7 @@ def create_full_simulation_dataset(f14, f22, f63):
     forcing_sequence = torch.stack(forcing_sequence, dim=0) # [time_steps, num_nodes, 4]
     true_zetas = torch.tensor(zeta, dtype=torch.float32).unsqueeze(2) # [time_steps, num_nodes, 1]
     
-    return forcing_sequence, edge_index, true_zetas, open_boundary_nodes
+    # Generate Legal Boundary Forcing from fort.15
+    boundary_tides = generate_boundary_tides(f14.replace('fort.14', 'fort.15'), f63, open_boundary_nodes)
+    
+    return forcing_sequence, edge_index, true_zetas, open_boundary_nodes, boundary_tides
