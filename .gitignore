@@ -1,0 +1,29 @@
+# ADCIRC/SWAN Data Files (Too large for Git)
+model_io/
+supporting_files/*.gif
+supporting_files/*.nc
+*.nc
+fort.*
+*.mat
+
+# Python caches and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Saved Models
+*.pth
+*.pt
+*.onnx
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# OS generated files
+.DS_Store
+Thumbs.db
