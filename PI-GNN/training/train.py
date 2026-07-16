@@ -20,7 +20,7 @@ def train_model():
             print(f"CRITICAL ERROR: {f} not found!")
             return
 
-    epochs = 50
+    epochs = 100
     learning_rate = 0.005
     
     print("1. Compiling Full Storm Dataset (Track + Mesh + Boundaries)...")
