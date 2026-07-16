@@ -13,7 +13,7 @@ class AutoregressiveSurrogate(torch.nn.Module):
         # Output is the RATE OF CHANGE of Water Level, U_velocity, and V_velocity
         self.out = torch.nn.Linear(16, 3)
 
-    def forward(self, forcing_sequence, edge_index, open_boundary_nodes=None, boundary_tides=None):
+    def forward(self, forcing_sequence, edge_index):
         time_steps = forcing_sequence.size(0)
         num_nodes = forcing_sequence.size(1)
         
@@ -66,11 +66,6 @@ class AutoregressiveSurrogate(torch.nn.Module):
             wd_mask = (H_check > 0.05).float()
             u_t = u_t * wd_mask
             v_t = v_t * wd_mask
-            
-            # === EXPLICIT TIDAL BOUNDARY FORCING (Dirichlet BC) ===
-            # Force the open ocean nodes to exactly match astronomical tides
-            if open_boundary_nodes is not None and boundary_tides is not None:
-                zeta_t[open_boundary_nodes, 0] = boundary_tides[t]
             
             simulated_zetas.append(zeta_t)
             

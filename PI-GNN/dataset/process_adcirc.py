@@ -116,7 +116,22 @@ def create_full_simulation_dataset(f14, f22, f63):
     
     track_data = parse_fort22(f22)
     
-    print(f"Building Forcing Tensors for {time_steps} timesteps...")
+    # Interpolate the track data to perfectly match the fort.63 output timesteps!
+    # This prevents the cyclone from moving too fast or too slow relative to the target data
+    orig_indices = np.linspace(0, 1, len(track_data))
+    target_indices = np.linspace(0, 1, time_steps)
+    
+    orig_lons = np.array([pt['lon'] for pt in track_data])
+    orig_lats = np.array([pt['lat'] for pt in track_data])
+    orig_vmax = np.array([pt['vmax'] for pt in track_data])
+    orig_pc = np.array([pt['pc'] for pt in track_data])
+    
+    interp_lons = np.interp(target_indices, orig_indices, orig_lons)
+    interp_lats = np.interp(target_indices, orig_indices, orig_lats)
+    interp_vmax = np.interp(target_indices, orig_indices, orig_vmax)
+    interp_pc = np.interp(target_indices, orig_indices, orig_pc)
+    
+    print(f"Building Forcing Tensors for {time_steps} interpolated timesteps...")
     depth = torch.tensor(nodes[:, 2], dtype=torch.float32).unsqueeze(1)
     
     # Spatially differing Manning's n from Depth (ADCIRC logic)
@@ -130,11 +145,12 @@ def create_full_simulation_dataset(f14, f22, f63):
     forcing_sequence = []
     
     for t in range(time_steps):
-        # Linearly map timestep to storm track (simplified mapping)
-        idx = min(t // (time_steps // len(track_data) + 1), len(track_data)-1)
-        current_storm = track_data[idx]
+        lon = interp_lons[t]
+        lat = interp_lats[t]
+        vmax = interp_vmax[t]
+        pc = interp_pc[t]
         
-        p_field, u_field, v_field = holland_wind_model(lons, lats, current_storm['lon'], current_storm['lat'], current_storm['vmax'], current_storm['pc'])
+        p_field, u_field, v_field = holland_wind_model(lons, lats, lon, lat, vmax, pc)
         
         f_depth = depth.squeeze()
         f_press = torch.tensor(p_field, dtype=torch.float32)
@@ -150,7 +166,4 @@ def create_full_simulation_dataset(f14, f22, f63):
     forcing_sequence = torch.stack(forcing_sequence, dim=0) # [time_steps, num_nodes, 4]
     true_zetas = torch.tensor(zeta, dtype=torch.float32).unsqueeze(2) # [time_steps, num_nodes, 1]
     
-    # Extract the exact tidal signals for the Open Boundary nodes to use as Dirichlet Forcing
-    boundary_tides = torch.tensor(zeta[:, open_boundary_nodes], dtype=torch.float32)
-    
-    return forcing_sequence, edge_index, true_zetas, open_boundary_nodes, boundary_tides
+    return forcing_sequence, edge_index, true_zetas, open_boundary_nodes

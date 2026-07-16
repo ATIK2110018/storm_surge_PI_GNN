@@ -20,7 +20,7 @@ def evaluate():
     f63 = os.path.join(base_dir, 'fort.63.nc')
     
     print("1. Re-loading the test data and trained model...")
-    forcing_sequence, edge_index, true_zetas, open_boundary_nodes, boundary_tides = create_full_simulation_dataset(f14, f22, f63)
+    forcing_sequence, edge_index, true_zetas, open_boundary_nodes = create_full_simulation_dataset(f14, f22, f63)
     
     num_nodes = forcing_sequence.size(1)
     # Model uses 5 features (Depth, P, U, V, Manning)
@@ -32,10 +32,9 @@ def evaluate():
     print("2. Running the Full Autoregressive Simulation...")
     forcing_sequence = forcing_sequence.to(device)
     edge_index = edge_index.to(device)
-    boundary_tides = boundary_tides.to(device)
     
     with torch.no_grad():
-        simulated_zetas = model(forcing_sequence, edge_index, open_boundary_nodes, boundary_tides)
+        simulated_zetas = model(forcing_sequence, edge_index)
         
     preds_array = simulated_zetas.cpu().numpy().squeeze()
     truth_array = true_zetas.numpy().squeeze()
