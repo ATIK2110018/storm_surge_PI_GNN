@@ -26,10 +26,25 @@ class AutoregressiveSurrogate(torch.nn.Module):
         simulated_zetas = []
         
         for t in range(time_steps):
-            forcing_t = forcing_sequence[t] # [num_nodes, 4]
+            forcing_t = forcing_sequence[t] # [num_nodes, 5]
             
-            # Combine the model's OWN prediction from the last step with the physical forcing
-            x_t = torch.cat([zeta_t, forcing_t], dim=1)
+            # === ADCIRC EXACT PHYSICS ===
+            # Extract Depth and Manning's n from the forcing tensor
+            depth = forcing_t[:, 0:1]
+            mannings_n = forcing_t[:, 4:5]
+            
+            # Calculate Total Water Depth (H = h + zeta)
+            # Clamp to 0.1m to prevent division by zero in dry nodes
+            H = torch.clamp(depth + zeta_t, min=0.1) 
+            
+            # ADCIRC Bottom Friction Coefficient (Cf)
+            Cf = (9.81 * mannings_n**2) / (H**(1/3))
+            
+            # Replace raw Manning's n with the mathematically exact Cf
+            physical_forcing = torch.cat([forcing_t[:, 0:4], Cf], dim=1)
+            
+            # Combine the model's OWN prediction with the physical forcing
+            x_t = torch.cat([zeta_t, physical_forcing], dim=1)
             
             # Spatial propagation across the mesh
             h = torch.relu(self.gcn1(x_t, edge_index))
