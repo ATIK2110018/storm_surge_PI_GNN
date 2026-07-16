@@ -1,11 +1,3 @@
-# ADCIRC/SWAN Data Files (Too large for Git)
-model_io/
-supporting_files/*.gif
-supporting_files/*.nc
-*.nc
-fort.*
-*.mat
-
 # Python caches and compiled files
 __pycache__/
 *.pyc
