@@ -107,6 +107,13 @@ def create_full_simulation_dataset(f14, f22, f63):
     
     print(f"Building Forcing Tensors for {time_steps} timesteps...")
     depth = torch.tensor(nodes[:, 2], dtype=torch.float32).unsqueeze(1)
+    
+    # Spatially differing Manning's n from Depth (ADCIRC logic)
+    # Deep water = 0.02, Coastal = 0.035, Land = 0.10
+    mannings_n = torch.where(depth > 20.0, torch.tensor(0.02),
+                 torch.where(depth > 2.0, torch.tensor(0.035),
+                 torch.where(depth > 0.0, torch.tensor(0.05), torch.tensor(0.10))))
+    
     lons, lats = nodes[:, 0], nodes[:, 1]
     
     forcing_sequence = []
@@ -122,8 +129,10 @@ def create_full_simulation_dataset(f14, f22, f63):
         f_press = torch.tensor(p_field, dtype=torch.float32)
         f_windu = torch.tensor(u_field, dtype=torch.float32)
         f_windv = torch.tensor(v_field, dtype=torch.float32)
+        f_n = mannings_n.squeeze()
         
-        feat_t = torch.stack([f_depth, f_press, f_windu, f_windv], dim=1)
+        # Now 5 Features: Depth, Pressure, WindU, WindV, Manning's N
+        feat_t = torch.stack([f_depth, f_press, f_windu, f_windv, f_n], dim=1)
         forcing_sequence.append(feat_t)
         
     forcing_sequence = torch.stack(forcing_sequence, dim=0) # [time_steps, num_nodes, 4]
