@@ -6,17 +6,14 @@ import datetime
 import math
 from torch_geometric.data import Data
 
-def generate_boundary_tides(f15, f63, open_boundary_nodes):
+def generate_boundary_tides(f15, t_seconds_5min, open_boundary_nodes):
     """
     Synthesizes exact Astronomical Tides from the fort.15 input file parameters.
     No data leakage from fort.63 water levels is used!
     """
     print("Synthesizing Astronomical Tides from fort.15 Inputs...")
-    ds63 = nc.Dataset(f63)
-    t_seconds = ds63.variables['time'][:] # Get the exact simulation time in seconds
-    ds63.close()
     
-    time_steps = len(t_seconds)
+    time_steps = len(t_seconds_5min)
     num_bnodes = len(open_boundary_nodes)
     boundary_tides = np.zeros((time_steps, num_bnodes))
     
@@ -58,7 +55,7 @@ def generate_boundary_tides(f15, f63, open_boundary_nodes):
         freqs[k]['efa'] = efa
         
     for t_idx in range(time_steps):
-        t = t_seconds[t_idx]
+        t = t_seconds_5min[t_idx]
         zeta = np.zeros(num_bnodes)
         for k in range(nbfr):
             amigt = freqs[k]['amigt']
@@ -175,30 +172,49 @@ def create_full_simulation_dataset(f14, f22, f63):
     nodes, elements, open_boundary_nodes = load_adcirc_mesh(f14)
     edge_index = create_graph_edges(elements)
     
-    # Target Data (ONLY for loss)
-    print("Loading fort.63.nc for Ground Truth Labels ONLY...")
+    # Load Target Data (ONLY for loss)
+    print("Loading fort.63.nc to generate target loss arrays...")
     ds63 = nc.Dataset(f63)
-    zeta = ds63.variables['zeta'][:]
+    orig_t_seconds = ds63.variables['time'][:]
+    orig_zeta = ds63.variables['zeta'][:]
     ds63.close()
-    zeta = np.ma.filled(zeta, 0.0)
-    time_steps, num_nodes = zeta.shape
+    orig_zeta = np.ma.filled(orig_zeta, 0.0)
+    
+    # === STRICT 5-MINUTE INTEGRATION TIMESTEP ===
+    # The user requested 5-minute (300 seconds) timesteps for the explicit integration loop.
+    dt_seconds = 300.0
+    start_time = orig_t_seconds[0]
+    end_time = orig_t_seconds[-1]
+    t_seconds_5min = np.arange(start_time, end_time, dt_seconds)
+    time_steps = len(t_seconds_5min)
+    
+    print(f"Decoupling temporal resolution... Generating dense 5-minute intervals ({time_steps} steps)...")
+    
+    from scipy.interpolate import interp1d
+    # Interpolate the ground truth answers so we can calculate loss at every 5-min step
+    interp_func_zeta = interp1d(orig_t_seconds, orig_zeta, axis=0, fill_value="extrapolate")
+    zeta_5min = interp_func_zeta(t_seconds_5min)
+    true_zetas = torch.tensor(zeta_5min, dtype=torch.float32).unsqueeze(2) # [time_steps, num_nodes, 1]
     
     track_data = parse_fort22(f22)
     
-    # Interpolate the track data to perfectly match the fort.63 output timesteps!
-    # This prevents the cyclone from moving too fast or too slow relative to the target data
-    orig_indices = np.linspace(0, 1, len(track_data))
-    target_indices = np.linspace(0, 1, time_steps)
+    # Interpolate the track data to perfectly match the dense 5-minute output timesteps!
+    orig_indices = np.linspace(start_time, end_time, len(track_data))
     
     orig_lons = np.array([pt['lon'] for pt in track_data])
     orig_lats = np.array([pt['lat'] for pt in track_data])
     orig_vmax = np.array([pt['vmax'] for pt in track_data])
     orig_pc = np.array([pt['pc'] for pt in track_data])
     
-    interp_lons = np.interp(target_indices, orig_indices, orig_lons)
-    interp_lats = np.interp(target_indices, orig_indices, orig_lats)
-    interp_vmax = np.interp(target_indices, orig_indices, orig_vmax)
-    interp_pc = np.interp(target_indices, orig_indices, orig_pc)
+    interp_func_lons = interp1d(orig_indices, orig_lons, fill_value="extrapolate")
+    interp_func_lats = interp1d(orig_indices, orig_lats, fill_value="extrapolate")
+    interp_func_vmax = interp1d(orig_indices, orig_vmax, fill_value="extrapolate")
+    interp_func_pc = interp1d(orig_indices, orig_pc, fill_value="extrapolate")
+    
+    interp_lons = interp_func_lons(t_seconds_5min)
+    interp_lats = interp_func_lats(t_seconds_5min)
+    interp_vmax = interp_func_vmax(t_seconds_5min)
+    interp_pc = interp_func_pc(t_seconds_5min)
     
     print(f"Building Forcing Tensors for {time_steps} interpolated timesteps...")
     depth = torch.tensor(nodes[:, 2], dtype=torch.float32).unsqueeze(1)
@@ -233,9 +249,8 @@ def create_full_simulation_dataset(f14, f22, f63):
         forcing_sequence.append(feat_t)
         
     forcing_sequence = torch.stack(forcing_sequence, dim=0) # [time_steps, num_nodes, 4]
-    true_zetas = torch.tensor(zeta, dtype=torch.float32).unsqueeze(2) # [time_steps, num_nodes, 1]
     
-    # Generate Legal Boundary Forcing from fort.15
-    boundary_tides = generate_boundary_tides(f14.replace('fort.14', 'fort.15'), f63, open_boundary_nodes)
+    # Generate Legal Boundary Forcing from fort.15 explicitly on the 5-minute timeline
+    boundary_tides = generate_boundary_tides(f14.replace('fort.14', 'fort.15'), t_seconds_5min, open_boundary_nodes)
     
     return forcing_sequence, edge_index, true_zetas, open_boundary_nodes, boundary_tides
