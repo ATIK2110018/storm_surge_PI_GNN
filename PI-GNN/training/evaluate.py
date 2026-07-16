@@ -108,6 +108,21 @@ def evaluate():
         plt.ylabel("Latitude")
         plt.savefig('spatial_error.png')
         print("Saved 'spatial_error.png'")
+    
+    # 3D: Boundary Node Visualization
+    if len(open_boundary_nodes) > 0:
+        import random
+        rand_boundary_node = random.choice(open_boundary_nodes)
+        plt.figure(figsize=(10, 4))
+        plt.plot(time_axis, truth_array[:, rand_boundary_node], label='ADCIRC Boundary (True Tide)', color='black', linewidth=2)
+        plt.plot(time_axis, preds_array[:, rand_boundary_node], label='PI-GNN Boundary Prediction', color='blue', linestyle='--', linewidth=2)
+        plt.title(f"Boundary Node {rand_boundary_node} Water Level")
+        plt.ylabel("Elevation (m)")
+        plt.xlabel("Time Steps")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig('boundary_node.png')
+        print("Saved 'boundary_node.png'")
 
 if __name__ == "__main__":
     evaluate()
