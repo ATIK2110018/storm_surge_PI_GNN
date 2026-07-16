@@ -43,9 +43,11 @@ class AutoregressiveSurrogate(torch.nn.Module):
             # Combine the model's STATE with physical forcing
             x_t = torch.cat([zeta_t, u_t, v_t, physical_forcing], dim=1)
             
-            # Spatial propagation across the mesh
-            h = torch.relu(self.gcn1(x_t, edge_index))
-            h = torch.relu(self.gcn2(h, edge_index))
+            import torch.nn.functional as F
+            
+            # Spatial propagation across the mesh using SiLU (Smooth Non-Linearity)
+            h = F.silu(self.gcn1(x_t, edge_index))
+            h = F.silu(self.gcn2(h, edge_index))
             
             # Predict the RATE OF CHANGE (dzeta/dt, du/dt, dv/dt)
             rates = self.out(h) 

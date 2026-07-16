@@ -20,7 +20,7 @@ def train_model():
             print(f"CRITICAL ERROR: {f} not found!")
             return
 
-    epochs = 1000
+    epochs = 2500
     learning_rate = 0.005
     
     print("1. Compiling Full Storm Dataset (Track + Mesh + Boundaries)...")
@@ -41,6 +41,7 @@ def train_model():
     boundary_tides = boundary_tides.to(device)
     
     optimizer = Adam(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     criterion = torch.nn.MSELoss()
     
     print("3. Starting True Simulation Loop...")
@@ -57,8 +58,11 @@ def train_model():
         # 3. Penalize the model and update weights
         loss.backward()
         optimizer.step()
+        scheduler.step()
         
-        print(f"Epoch {epoch+1}/{epochs} | Global Simulation Data Loss: {loss.item():.6f}")
+        if (epoch+1) % 10 == 0:
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"Epoch {epoch+1}/{epochs} - Data Loss: {loss.item():.6f} - LR: {current_lr:.6f}")
         
     print("Training Complete. Saving simulator...")
     torch.save(model.state_dict(), os.path.join(os.path.dirname(__file__), 'pi_gnn_model.pth'))
