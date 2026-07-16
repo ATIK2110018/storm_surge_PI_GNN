@@ -25,17 +25,14 @@ def train_model():
             return
 
     # Hyperparameters
-    epochs = 2  # Keep it low for testing
+    epochs = 50
     learning_rate = 0.005
     window_size = 6  # Look back 6 time steps
     horizon = 1      # Predict 1 time step ahead
     
-    # FOR LAPTOP TESTING: Limit time steps to avoid Out-Of-Memory errors
-    MAX_TIME_STEPS = 50 
-    
-    print(f"1. Compiling Dataset from netCDF files (First {MAX_TIME_STEPS} steps for laptop testing)...")
-    # This processes the data
-    dataset = create_sequence_dataset(f14, f63, f73, f74, window_size=window_size, horizon=horizon, max_time_steps=MAX_TIME_STEPS)
+    print("1. Compiling Dataset from netCDF files (Full Storm Dataset)...")
+    # This processes the actual massive datasets
+    dataset = create_sequence_dataset(f14, f63, f73, f74, window_size=window_size, horizon=horizon)
     
     # Split into Train (80%) and Val (20%) sequences
     train_size = int(0.8 * len(dataset))
