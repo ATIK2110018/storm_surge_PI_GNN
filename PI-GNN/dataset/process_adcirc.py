@@ -28,7 +28,24 @@ def load_adcirc_mesh(fort14_path):
             elements[i, 1] = int(parts[3]) - 1
             elements[i, 2] = int(parts[4]) - 1
             
-    return nodes, elements
+        # Parse Open Boundaries
+        open_boundary_nodes = []
+        try:
+            nope_line = f.readline().split()
+            nope = int(nope_line[0]) # Number of open boundaries
+            neta_line = f.readline().split()
+            neta = int(neta_line[0]) # Total number of open boundary nodes
+            
+            for _ in range(nope):
+                seg_info = f.readline().split()
+                num_nodes_in_seg = int(seg_info[0])
+                for _ in range(num_nodes_in_seg):
+                    node_id = int(f.readline().strip()) - 1
+                    open_boundary_nodes.append(node_id)
+        except:
+            print("Warning: Could not parse open boundaries from fort.14. Returning empty list.")
+            
+    return nodes, elements, np.array(open_boundary_nodes)
 
 def create_graph_edges(elements):
     """
@@ -89,11 +106,13 @@ def load_dynamic_data(fort63_path, fort73_path, fort74_path):
 def create_sequence_dataset(f14, f63, f73, f74, window_size=6, horizon=1, max_time_steps=None):
     """
     Creates a temporal sequence dataset.
-    Given [t-window_size ... t], predict [t+horizon].
+    Returns: dataset, open_boundary_nodes
     """
-    print("Parsing mesh...")
-    nodes, elements = load_adcirc_mesh(f14)
+    print("Parsing mesh and boundaries...")
+    nodes, elements, open_boundary_nodes = load_adcirc_mesh(f14)
     edge_index = create_graph_edges(elements)
+    
+    print(f"Found {len(open_boundary_nodes)} Open Boundary Nodes!")
     
     zeta, pressure, windx, windy = load_dynamic_data(f63, f73, f74)
     time_steps, num_nodes = zeta.shape
@@ -142,4 +161,4 @@ def create_sequence_dataset(f14, f63, f73, f74, window_size=6, horizon=1, max_ti
         dataset.append(data)
         
     print(f"Total sequences created: {len(dataset)}")
-    return dataset
+    return dataset, open_boundary_nodes
