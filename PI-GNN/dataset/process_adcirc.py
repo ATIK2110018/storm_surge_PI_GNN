@@ -88,6 +88,57 @@ def haversine_distance(lon1, lat1, lon2, lat2):
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
     return R * c
 
+def holland_wind_model(lons, lats, storm_lon, storm_lat, vmax_knots, pc_mb, pn_mb=1010.0):
+    """
+    Computes Holland (1980) Parametric Wind and Pressure fields.
+    Returns: pressure (mb), wind_u (m/s), wind_v (m/s)
+    """
+    # Constants
+    rho_air = 1.15 # kg/m^3
+    e = np.exp(1)
+    omega = 7.2921e-5 # Earth rotation rate (rad/s)
+    
+    # Distance to storm center in km, and angle
+    r_km = haversine_distance(lons, lats, storm_lon, storm_lat)
+    r_meters = np.maximum(r_km * 1000.0, 1.0) # Avoid division by zero
+    
+    # Angle from node to storm center (for wind direction)
+    theta = np.arctan2(np.radians(lats - storm_lat), np.radians(lons - storm_lon))
+    
+    # Coriolis parameter
+    f = 2 * omega * np.sin(np.radians(lats))
+    
+    # Convert Vmax to m/s
+    vmax_ms = vmax_knots * 0.514444
+    
+    # Estimate Rmax (km) if not provided (empirical formula)
+    rmax_km = np.maximum(47.0 - 0.41 * (pn_mb - pc_mb), 15.0)
+    rmax_meters = rmax_km * 1000.0
+    
+    # Calculate Holland B parameter
+    delta_p_pa = (pn_mb - pc_mb) * 100.0 # Convert mb to Pascals
+    if delta_p_pa <= 0:
+        return np.full_like(lons, pn_mb), np.zeros_like(lons), np.zeros_like(lons)
+        
+    B = (vmax_ms**2 * rho_air * e) / delta_p_pa
+    B = np.clip(B, 1.0, 2.5) # Physical bounds for B
+    
+    # Calculate Pressure Field: P(r) = Pc + (Pn - Pc) * exp(-(Rmax/r)^B)
+    pressure_field = pc_mb + (pn_mb - pc_mb) * np.exp(-1.0 * (rmax_meters / r_meters)**B)
+    
+    # Calculate Gradient Wind Speed
+    term1 = (B / rho_air) * delta_p_pa * (rmax_meters / r_meters)**B * np.exp(-1.0 * (rmax_meters / r_meters)**B)
+    term2 = (r_meters * f / 2.0)**2
+    v_gradient = np.sqrt(term1 + term2) - (r_meters * np.abs(f) / 2.0)
+    
+    # Convert scalar wind to U, V components (inflowing cyclonic swirl)
+    inflow_angle = np.radians(15.0) # 15 degree inflow
+    wind_u = -v_gradient * np.sin(theta + inflow_angle)
+    wind_v = v_gradient * np.cos(theta + inflow_angle)
+    
+    return pressure_field, wind_u, wind_v
+
+
 def interpolate_track(track_data, target_time_steps):
     """
     Interpolates 3-hourly track data into exact simulation time steps.
@@ -134,17 +185,17 @@ def create_sequence_dataset(f14, f22, f63, window_size=6, horizon=1):
         for step in range(t, t + window_size):
             current_storm = sim_track[step]
             
-            # Calculate dynamic parametric features for EVERY node
-            dist_to_eye = haversine_distance(lons, lats, current_storm['lon'], current_storm['lat'])
+            # Calculate Holland Parametric Wind and Pressure fields for EVERY node
+            p_field, u_field, v_field = holland_wind_model(lons, lats, current_storm['lon'], current_storm['lat'], current_storm['vmax'], current_storm['pc'])
             
             # Feature Tensors
             f_depth = depth.squeeze()
-            f_dist = torch.tensor(dist_to_eye, dtype=torch.float32)
-            f_vmax = torch.full((num_nodes,), current_storm['vmax'], dtype=torch.float32)
-            f_pc = torch.full((num_nodes,), current_storm['pc'], dtype=torch.float32)
+            f_press = torch.tensor(p_field, dtype=torch.float32)
+            f_windu = torch.tensor(u_field, dtype=torch.float32)
+            f_windv = torch.tensor(v_field, dtype=torch.float32)
             
-            # Note: No 'zeta', 'wind', or 'pressure' grids are fed in here!
-            feat_t = torch.stack([f_depth, f_dist, f_vmax, f_pc], dim=1)
+            # Explicit Holland Generated Fields
+            feat_t = torch.stack([f_depth, f_press, f_windu, f_windv], dim=1)
             node_features.append(feat_t)
             
         x = torch.stack(node_features, dim=1)
