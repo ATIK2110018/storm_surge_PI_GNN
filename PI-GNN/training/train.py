@@ -24,7 +24,7 @@ def train_model():
     learning_rate = 0.005
     
     print("1. Compiling Full Storm Dataset (Track + Mesh + Boundaries)...")
-    forcing_sequence, edge_index, true_zetas, open_boundary_nodes = create_full_simulation_dataset(f14, f22, f63)
+    forcing_sequence, edge_index, true_zetas, open_boundary_nodes, boundary_tides = create_full_simulation_dataset(f14, f22, f63)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"2. Initializing Autoregressive Simulator on {device}...")
@@ -38,6 +38,7 @@ def train_model():
     forcing_sequence = forcing_sequence.to(device)
     edge_index = edge_index.to(device)
     true_zetas = true_zetas.to(device)
+    boundary_tides = boundary_tides.to(device)
     
     optimizer = Adam(model.parameters(), lr=learning_rate)
     criterion = torch.nn.MSELoss()
@@ -48,7 +49,7 @@ def train_model():
         optimizer.zero_grad()
         
         # 1. The model starts at t=0 and simulates ALL time steps blindly!
-        simulated_zetas = model(forcing_sequence, edge_index)
+        simulated_zetas = model(forcing_sequence, edge_index, open_boundary_nodes, boundary_tides)
         
         # 2. Compare the fully simulated 3-day hydrograph against ADCIRC fort.63
         loss = criterion(simulated_zetas, true_zetas)

@@ -84,11 +84,22 @@ def holland_wind_model(lons, lats, storm_lon, storm_lat, vmax_knots, pc_mb, pn_m
     term2 = (r_meters * f / 2.0)**2
     v_gradient = np.sqrt(term1 + term2) - (r_meters * np.abs(f) / 2.0)
     
+    # Convert scalar wind to U, V components (inflowing cyclonic swirl)
     inflow_angle = np.radians(15.0)
     wind_u = -v_gradient * np.sin(theta + inflow_angle)
     wind_v = v_gradient * np.cos(theta + inflow_angle)
     
-    return pressure_field, wind_u, wind_v
+    # === EXPLICIT WIND STRESS CONVERSION ===
+    # Garratt's Drag Coefficient Formula
+    wind_mag = np.sqrt(wind_u**2 + wind_v**2)
+    Cd = (0.75 + 0.067 * wind_mag) * 1e-3
+    Cd = np.clip(Cd, 0.0, 0.0035) # Cap drag at extreme hurricane speeds
+    
+    # Wind Stress (tau)
+    tau_x = Cd * rho_air * wind_u * wind_mag
+    tau_y = Cd * rho_air * wind_v * wind_mag
+    
+    return pressure_field, tau_x, tau_y
 
 def create_full_simulation_dataset(f14, f22, f63):
     """Returns a single massive forcing tensor covering all timesteps."""
@@ -127,15 +138,19 @@ def create_full_simulation_dataset(f14, f22, f63):
         
         f_depth = depth.squeeze()
         f_press = torch.tensor(p_field, dtype=torch.float32)
+        # Note: windu and windv are now technically tau_x and tau_y (Wind Stress)
         f_windu = torch.tensor(u_field, dtype=torch.float32)
         f_windv = torch.tensor(v_field, dtype=torch.float32)
         f_n = mannings_n.squeeze()
         
-        # Now 5 Features: Depth, Pressure, WindU, WindV, Manning's N
+        # Now 5 Features: Depth, Pressure, Tau_X, Tau_Y, Manning's N
         feat_t = torch.stack([f_depth, f_press, f_windu, f_windv, f_n], dim=1)
         forcing_sequence.append(feat_t)
         
     forcing_sequence = torch.stack(forcing_sequence, dim=0) # [time_steps, num_nodes, 4]
     true_zetas = torch.tensor(zeta, dtype=torch.float32).unsqueeze(2) # [time_steps, num_nodes, 1]
     
-    return forcing_sequence, edge_index, true_zetas, open_boundary_nodes
+    # Extract the exact tidal signals for the Open Boundary nodes to use as Dirichlet Forcing
+    boundary_tides = torch.tensor(zeta[:, open_boundary_nodes], dtype=torch.float32)
+    
+    return forcing_sequence, edge_index, true_zetas, open_boundary_nodes, boundary_tides
