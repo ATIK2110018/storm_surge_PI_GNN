@@ -24,7 +24,7 @@ def train_model():
     learning_rate = 0.005
     
     print("1. Compiling Full Storm Dataset (Track + Mesh + Boundaries)...")
-    forcing_sequence, edge_index, true_zetas, open_boundary_nodes, boundary_tides = create_full_simulation_dataset(f14, f22, f63)
+    forcing_sequence, edge_index, edge_weight, true_zetas, open_boundary_nodes, boundary_tides = create_full_simulation_dataset(f14, f22, f63)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"2. Initializing Autoregressive Simulator on {device}...")
@@ -38,6 +38,7 @@ def train_model():
     # Move huge tensors to device
     forcing_sequence = forcing_sequence.to(device)
     edge_index = edge_index.to(device)
+    edge_weight = edge_weight.to(device)
     true_zetas = true_zetas.to(device)
     boundary_tides = boundary_tides.to(device)
     
@@ -65,6 +66,7 @@ def train_model():
             sim_chunk, zeta_t, u_t, v_t = model(
                 forcing_sequence[start_t:end_t], 
                 edge_index, 
+                edge_weight,
                 open_boundary_nodes, 
                 boundary_tides[start_t:end_t] if boundary_tides is not None else None,
                 initial_states=(zeta_t, u_t, v_t)

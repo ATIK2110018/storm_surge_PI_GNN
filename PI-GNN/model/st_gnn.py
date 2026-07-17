@@ -4,16 +4,19 @@ from torch_geometric.nn import GCNConv
 class AutoregressiveSurrogate(torch.nn.Module):
     def __init__(self, num_nodes, num_forcing_features=5):
         super(AutoregressiveSurrogate, self).__init__()
-        # State variables: [Zeta_t, U_t, V_t] (3)
-        # Forcing: [Depth, Pressure, Tau_x, Tau_y, Cf] (5)
-        # Total input features = 8
-        self.gcn1 = GCNConv(3 + num_forcing_features, 32)
-        self.gcn2 = GCNConv(32, 16)
+        
+        # Deep Architecture (Increased from 16 to 128 dimensions, added layers)
+        in_channels = 3 + num_forcing_features
+        hidden_dim = 128
+        
+        self.gcn1 = GCNConv(in_channels, hidden_dim)
+        self.gcn2 = GCNConv(hidden_dim, hidden_dim)
+        self.gcn3 = GCNConv(hidden_dim, hidden_dim)
         
         # Output is the RATE OF CHANGE of Water Level, U_velocity, and V_velocity
-        self.out = torch.nn.Linear(16, 3)
+        self.out = torch.nn.Linear(hidden_dim, 3)
 
-    def forward(self, forcing_sequence, edge_index, open_boundary_nodes=None, boundary_tides=None, initial_states=None):
+    def forward(self, forcing_sequence, edge_index, edge_weight, open_boundary_nodes=None, boundary_tides=None, initial_states=None):
         time_steps = forcing_sequence.size(0)
         num_nodes = forcing_sequence.size(1)
         
@@ -48,9 +51,10 @@ class AutoregressiveSurrogate(torch.nn.Module):
             
             import torch.nn.functional as F
             
-            # Spatial propagation across the mesh using SiLU (Smooth Non-Linearity)
-            h = F.silu(self.gcn1(x_t, edge_index))
-            h = F.silu(self.gcn2(h, edge_index))
+            # Deep Message Passing with EXACT Spatial Edge Weights!
+            h = F.silu(self.gcn1(x_t, edge_index, edge_weight=edge_weight))
+            h = F.silu(self.gcn2(h, edge_index, edge_weight=edge_weight))
+            h = F.silu(self.gcn3(h, edge_index, edge_weight=edge_weight))
             
             # Predict the RATE OF CHANGE (dzeta/dt, du/dt, dv/dt)
             rates = self.out(h) 

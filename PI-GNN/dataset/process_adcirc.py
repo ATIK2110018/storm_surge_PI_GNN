@@ -6,6 +6,16 @@ import datetime
 import math
 from torch_geometric.data import Data
 
+def haversine(lon1, lat1, lon2, lat2):
+    """Calculates the exact great-circle distance between two points in meters."""
+    R = 6371000 # Radius of Earth in meters
+    phi1, phi2 = np.radians(lat1), np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlam = np.radians(lon2 - lon1)
+    a = np.sin(dphi/2)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam/2)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    return R * c
+
 def generate_boundary_tides(f15, t_seconds_5min, open_boundary_nodes):
     """
     Synthesizes exact Astronomical Tides from the fort.15 input file parameters.
@@ -251,7 +261,16 @@ def create_full_simulation_dataset(f14, f22, f63):
         
     forcing_sequence = torch.stack(forcing_sequence, dim=0) # [time_steps, num_nodes, 4]
     
-    # Generate Legal Boundary Forcing from fort.15 explicitly on the 5-minute timeline
+    # Generate Legal Boundary Forcing from fort.15 explicitly on the 15-minute timeline
     boundary_tides = generate_boundary_tides(f14.replace('fort.14', 'fort.15'), t_seconds_5min, open_boundary_nodes)
     
-    return forcing_sequence, edge_index, true_zetas, open_boundary_nodes, boundary_tides
+    # === SPATIAL PHYSICS (EDGE WEIGHTS) ===
+    # Calculate exact physical distance between connected nodes to allow GNN to compute spatial gradients (wave slopes)
+    print("Computing Haversine Spatial Gradients for Edges...")
+    src = edge_index[0].numpy()
+    dst = edge_index[1].numpy()
+    dists = haversine(nodes[src, 0], nodes[src, 1], nodes[dst, 0], nodes[dst, 1])
+    dists = np.clip(dists, 1.0, None) # Prevent divide by zero
+    edge_weight = torch.tensor(1.0 / dists, dtype=torch.float32) # Inverse distance weighting
+    
+    return forcing_sequence, edge_index, edge_weight, true_zetas, open_boundary_nodes, boundary_tides
