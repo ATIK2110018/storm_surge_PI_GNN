@@ -53,7 +53,9 @@ def train_model():
         v_t = torch.zeros((num_nodes, 1), dtype=torch.float32, device=device)
         
         total_loss = 0
-        chunk_size = 24
+        # Increased chunk_size to 120 to utilize more of the available 14GB VRAM
+        # This increases the parallel batching size and significantly speeds up training!
+        chunk_size = 120
         num_chunks = 0
         
         for start_t in range(0, time_steps, chunk_size):
