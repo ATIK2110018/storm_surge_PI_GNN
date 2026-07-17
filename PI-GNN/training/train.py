@@ -30,6 +30,7 @@ def train_model():
     print(f"2. Initializing Autoregressive Simulator on {device}...")
     
     num_nodes = forcing_sequence.size(1)
+    time_steps = forcing_sequence.size(0)
     num_features = forcing_sequence.size(2) # 4 forcing features
     
     model = AutoregressiveSurrogate(num_nodes=num_nodes, num_forcing_features=num_features).to(device)
