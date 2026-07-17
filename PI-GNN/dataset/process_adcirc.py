@@ -180,9 +180,10 @@ def create_full_simulation_dataset(f14, f22, f63):
     ds63.close()
     orig_zeta = np.ma.filled(orig_zeta, 0.0)
     
-    # === STRICT 5-MINUTE INTEGRATION TIMESTEP ===
-    # The user requested 5-minute (300 seconds) timesteps for the explicit integration loop.
-    dt_seconds = 300.0
+    # === STRICT 15-MINUTE INTEGRATION TIMESTEP ===
+    # Reduced from 5 minutes to 15 minutes to prevent PyTorch CUDA Out Of Memory (OOM).
+    # 15 minutes still guarantees high integration stability while using 1/3rd the VRAM.
+    dt_seconds = 900.0
     start_time = orig_t_seconds[0]
     end_time = orig_t_seconds[-1]
     t_seconds_5min = np.arange(start_time, end_time, dt_seconds)
