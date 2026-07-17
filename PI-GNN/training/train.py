@@ -46,23 +46,44 @@ def train_model():
     
     print("3. Starting True Simulation Loop...")
     for epoch in range(epochs):
-        model.train()
-        optimizer.zero_grad()
         
-        # 1. The model starts at t=0 and simulates ALL time steps blindly!
-        simulated_zetas = model(forcing_sequence, edge_index, open_boundary_nodes, boundary_tides)
+        zeta_t = torch.zeros((num_nodes, 1), dtype=torch.float32, device=device)
+        u_t = torch.zeros((num_nodes, 1), dtype=torch.float32, device=device)
+        v_t = torch.zeros((num_nodes, 1), dtype=torch.float32, device=device)
         
-        # 2. Compare the fully simulated 3-day hydrograph against ADCIRC fort.63
-        loss = criterion(simulated_zetas, true_zetas)
+        total_loss = 0
+        chunk_size = 24
+        num_chunks = 0
         
-        # 3. Penalize the model and update weights
-        loss.backward()
-        optimizer.step()
+        for start_t in range(0, time_steps, chunk_size):
+            optimizer.zero_grad()
+            end_t = min(start_t + chunk_size, time_steps)
+            
+            sim_chunk, zeta_t, u_t, v_t = model(
+                forcing_sequence[start_t:end_t], 
+                edge_index, 
+                open_boundary_nodes, 
+                boundary_tides[start_t:end_t] if boundary_tides is not None else None,
+                initial_states=(zeta_t, u_t, v_t)
+            )
+            
+            loss = criterion(sim_chunk, true_zetas[start_t:end_t])
+            loss.backward()
+            optimizer.step()
+            
+            # True TBPTT detachment
+            zeta_t = zeta_t.detach()
+            u_t = u_t.detach()
+            v_t = v_t.detach()
+            
+            total_loss += loss.item()
+            num_chunks += 1
+            
+        avg_loss = total_loss / num_chunks
         scheduler.step()
         
-        if (epoch+1) % 10 == 0:
-            current_lr = scheduler.get_last_lr()[0]
-            print(f"Epoch {epoch+1}/{epochs} - Data Loss: {loss.item():.6f} - LR: {current_lr:.6f}")
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch}/{epochs} | Avg TBPTT Loss (MSE): {avg_loss:.6f} | LR: {scheduler.get_last_lr()[0]:.6e}")
         
     print("Training Complete. Saving simulator...")
     torch.save(model.state_dict(), os.path.join(os.path.dirname(__file__), 'pi_gnn_model.pth'))

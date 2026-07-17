@@ -13,26 +13,21 @@ class AutoregressiveSurrogate(torch.nn.Module):
         # Output is the RATE OF CHANGE of Water Level, U_velocity, and V_velocity
         self.out = torch.nn.Linear(16, 3)
 
-    def forward(self, forcing_sequence, edge_index, open_boundary_nodes=None, boundary_tides=None):
+    def forward(self, forcing_sequence, edge_index, open_boundary_nodes=None, boundary_tides=None, initial_states=None):
         time_steps = forcing_sequence.size(0)
         num_nodes = forcing_sequence.size(1)
         
-        # Initial conditions: Water level and velocities are 0
-        zeta_t = torch.zeros((num_nodes, 1), device=forcing_sequence.device)
-        u_t = torch.zeros((num_nodes, 1), device=forcing_sequence.device)
-        v_t = torch.zeros((num_nodes, 1), device=forcing_sequence.device)
-        
+        device = forcing_sequence.device
+        if initial_states is not None:
+            zeta_t, u_t, v_t = initial_states
+        else:
+            zeta_t = torch.zeros((num_nodes, 1), dtype=torch.float32, device=device)
+            u_t = torch.zeros((num_nodes, 1), dtype=torch.float32, device=device)
+            v_t = torch.zeros((num_nodes, 1), dtype=torch.float32, device=device)
+            
         simulated_zetas = []
         
         for t in range(time_steps):
-            # === TRUNCATED BACKPROPAGATION THROUGH TIME (TBPTT) ===
-            # Sever the computation graph every 24 steps to prevent CUDA Out of Memory.
-            # This allows the network to learn on infinitely long sequences without exploding VRAM.
-            if self.training and t % 24 == 0 and t > 0:
-                zeta_t = zeta_t.detach()
-                u_t = u_t.detach()
-                v_t = v_t.detach()
-                
             forcing_t = forcing_sequence[t] # [num_nodes, 5]
             
             # === ADCIRC EXACT PHYSICS ===
@@ -82,4 +77,4 @@ class AutoregressiveSurrogate(torch.nn.Module):
                 
             simulated_zetas.append(zeta_t)
             
-        return torch.stack(simulated_zetas, dim=0)
+        return torch.stack(simulated_zetas, dim=0), zeta_t, u_t, v_t

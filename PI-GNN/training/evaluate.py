@@ -35,7 +35,7 @@ def evaluate():
     boundary_tides = boundary_tides.to(device)
     
     with torch.no_grad():
-        simulated_zetas = model(forcing_sequence, edge_index, open_boundary_nodes, boundary_tides)
+        simulated_zetas, _, _, _ = model(forcing_sequence, edge_index, open_boundary_nodes, boundary_tides)
         
     preds_array = simulated_zetas.cpu().numpy().squeeze()
     truth_array = true_zetas.numpy().squeeze()
