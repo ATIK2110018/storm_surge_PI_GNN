@@ -25,6 +25,14 @@ class AutoregressiveSurrogate(torch.nn.Module):
         simulated_zetas = []
         
         for t in range(time_steps):
+            # === TRUNCATED BACKPROPAGATION THROUGH TIME (TBPTT) ===
+            # Sever the computation graph every 24 steps to prevent CUDA Out of Memory.
+            # This allows the network to learn on infinitely long sequences without exploding VRAM.
+            if self.training and t % 24 == 0 and t > 0:
+                zeta_t = zeta_t.detach()
+                u_t = u_t.detach()
+                v_t = v_t.detach()
+                
             forcing_t = forcing_sequence[t] # [num_nodes, 5]
             
             # === ADCIRC EXACT PHYSICS ===
