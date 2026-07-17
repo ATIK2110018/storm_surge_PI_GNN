@@ -47,7 +47,7 @@ def train_model():
     criterion = torch.nn.MSELoss()
     
     # Kaggle T4 Tensor Core Optimization (Mixed Precision)
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
     
     print("3. Starting True Simulation Loop...")
     for epoch in range(epochs):
@@ -57,9 +57,9 @@ def train_model():
         v_t = torch.zeros((num_nodes, 1), dtype=torch.float32, device=device)
         
         total_loss = 0
-        # Increased chunk_size to 120 to utilize more of the available 14GB VRAM
-        # This increases the parallel batching size and significantly speeds up training!
-        chunk_size = 120
+        # Dropped chunk_size back to 24 because the new Deep 128-dimensional GNN 
+        # is massive and requires more VRAM per step than the old 16-dim network.
+        chunk_size = 24
         num_chunks = 0
         
         for start_t in range(0, time_steps, chunk_size):
@@ -67,7 +67,7 @@ def train_model():
             end_t = min(start_t + chunk_size, time_steps)
             
             # Run the physics loop through NVIDIA Tensor Cores!
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 sim_chunk, zeta_t, u_t, v_t = model(
                     forcing_sequence[start_t:end_t], 
                     edge_index, 
