@@ -21,7 +21,7 @@ def train_model():
             return
 
     epochs = 2500
-    learning_rate = 0.005
+    learning_rate = 0.0005 # Dropped 10x to ensure smooth, linear convergence
     
     print("1. Compiling Full Storm Dataset (Track + Mesh + Boundaries)...")
     forcing_sequence, edge_index, edge_weight, true_zetas, open_boundary_nodes, boundary_tides = create_full_simulation_dataset(f14, f22, f63)
@@ -74,6 +74,10 @@ def train_model():
             
             loss = criterion(sim_chunk, true_zetas[start_t:end_t])
             loss.backward()
+            
+            # Gradient Clipping: Prevents abrupt spikes in the loss curve!
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             # True TBPTT detachment
