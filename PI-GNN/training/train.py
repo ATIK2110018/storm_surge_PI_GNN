@@ -46,9 +46,6 @@ def train_model():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     criterion = torch.nn.MSELoss()
     
-    # Kaggle T4 Tensor Core Optimization (Mixed Precision)
-    scaler = torch.amp.GradScaler('cuda')
-    
     print("3. Starting True Simulation Loop...")
     for epoch in range(epochs):
         
@@ -66,27 +63,22 @@ def train_model():
             optimizer.zero_grad()
             end_t = min(start_t + chunk_size, time_steps)
             
-            # Run the physics loop through NVIDIA Tensor Cores!
-            with torch.amp.autocast('cuda'):
-                sim_chunk, zeta_t, u_t, v_t = model(
-                    forcing_sequence[start_t:end_t], 
-                    edge_index, 
-                    edge_weight,
-                    open_boundary_nodes, 
-                    boundary_tides[start_t:end_t] if boundary_tides is not None else None,
-                    initial_states=(zeta_t, u_t, v_t)
-                )
-                
-                loss = criterion(sim_chunk, true_zetas[start_t:end_t])
-                
-            scaler.scale(loss).backward()
+            # Standard float32 precision for Explicit Euler numerical stability!
+            sim_chunk, zeta_t, u_t, v_t = model(
+                forcing_sequence[start_t:end_t], 
+                edge_index, 
+                edge_weight,
+                open_boundary_nodes, 
+                boundary_tides[start_t:end_t] if boundary_tides is not None else None,
+                initial_states=(zeta_t, u_t, v_t)
+            )
+            
+            loss = criterion(sim_chunk, true_zetas[start_t:end_t])
+            loss.backward()
             
             # Gradient Clipping: Prevents abrupt spikes in the loss curve!
-            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             
             # True TBPTT detachment
             zeta_t = zeta_t.detach()

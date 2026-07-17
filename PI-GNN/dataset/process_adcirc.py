@@ -13,6 +13,7 @@ def haversine(lon1, lat1, lon2, lat2):
     dphi = np.radians(lat2 - lat1)
     dlam = np.radians(lon2 - lon1)
     a = np.sin(dphi/2)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam/2)**2
+    a = np.clip(a, 0.0, 1.0) # CRITICAL: Prevent float precision errors from causing negative sqrt (NaN)
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return R * c
 
