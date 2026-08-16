@@ -195,10 +195,10 @@ def train_model():
         print(f"  >>> Epoch {epoch} Summary | Avg Data: {avg_epoch_data:.5f} | "
               f"Val Loss: {avg_val:.5f}")
 
-        # Save best checkpoint from epoch 20+
-        if epoch == 20:
+        # Save best checkpoint from epoch 45+
+        if epoch == 45:
             best_loss = float('inf')
-        if epoch >= 20 and avg_epoch_data < best_loss:
+        if epoch >= 45 and avg_epoch_data < best_loss:
             best_loss = avg_epoch_data
             torch.save(model.state_dict(),
                        os.path.join(os.path.dirname(__file__), 'pi_gnn_model_best.pth'))
