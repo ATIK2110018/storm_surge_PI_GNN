@@ -36,7 +36,7 @@ class GNNLayer(nn.Module):
         return self.norm(h + h_new)
 
 class ParametricPIGNN(torch.nn.Module):
-    def __init__(self, num_nodes, num_forcing_features=6, hidden_dim=64, n_layers=4):
+    def __init__(self, num_nodes, num_forcing_features=6, hidden_dim=32, n_layers=3):
         super(ParametricPIGNN, self).__init__()
 
         # node_in = XY(2) + physics(num_forcing_features) + prev_state(3)

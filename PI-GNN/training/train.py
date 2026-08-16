@@ -88,12 +88,13 @@ def train_model():
 
         # Window expansion (same schedule as FlowFM reference)
         window = int(min(2000 + (epoch - 1) * (total_t / 17.0), total_t))
-        # Sample random START times for multi-step rollout.
-        # We need chunk_size=4, so max t_idx is split_idx - 4
-        chunk_size = 4
-        valid_train = train_indices[(train_indices >= 1) & (train_indices < window - chunk_size)]
-        
-        steps_per_epoch = min(1000, len(valid_train))
+        # chunk_size=1: 30k-node graph × 64 hidden × 4 layers already uses ~14GB.
+        # Multi-step unrolling would OOM. Drift is prevented by absolute-zeta
+        # prediction and noise injection instead.
+        chunk_size = 1
+        valid_train = train_indices[(train_indices >= 1) & (train_indices < window)]
+
+        steps_per_epoch = min(500, len(valid_train))
         t_sample = np.random.choice(valid_train, size=steps_per_epoch, replace=False)
 
         print(f"\n--- Epoch {epoch}/{epochs} | {stage} | window={window} steps ---")
@@ -116,28 +117,28 @@ def train_model():
                 torch.zeros_like(true_prev_zeta),          # V₀ = 0
             ], dim=1)                                      # [N, 3]
 
-            # Run 4 time steps (chunk_size = 4) autoregressively
+            # Run 1 time step (chunk_size=1 to fit in 15GB GPU VRAM)
             sim_chunk, u_chunk, v_chunk, _ = model(
-                forcing_sequence[t_idx : t_idx + chunk_size],
+                forcing_sequence[t_idx : t_idx + 1],
                 edge_index,
                 edge_weight,
                 nodes_xy_t,
                 open_boundary_nodes,
-                boundary_tides[t_idx : t_idx + chunk_size] if boundary_tides is not None else None,
+                boundary_tides[t_idx : t_idx + 1] if boundary_tides is not None else None,
                 prev_state,
             )
 
-            # Masked MSE loss for all 4 steps
-            mask_t = wet_mask[t_idx : t_idx + chunk_size].unsqueeze(-1).float()  # [chunk_size, N, 1]
+            # Masked MSE loss
+            mask_t = wet_mask[t_idx].unsqueeze(0).unsqueeze(-1).float()  # [1, N, 1]
             n_wet  = mask_t.sum().clamp(min=1.0)
-            data_loss = ((sim_chunk - true_zetas[t_idx : t_idx + chunk_size])**2 * mask_t).sum() / n_wet
+            data_loss = ((sim_chunk - true_zetas[t_idx : t_idx + 1])**2 * mask_t).sum() / n_wet
 
-            # Physics loss evaluated on the sequence
+            # Physics loss: prepend the (noisy) prev state to build a [2,N,1] window
             if phys_weight > 0.0:
-                zeta_phys = torch.cat([noisy_prev_zeta.unsqueeze(0), sim_chunk], dim=0)
-                u_phys = torch.cat([torch.zeros_like(true_prev_zeta).unsqueeze(0), u_chunk], dim=0)
-                v_phys = torch.cat([torch.zeros_like(true_prev_zeta).unsqueeze(0), v_chunk], dim=0)
-                forcing_phys = forcing_sequence[t_idx - 1 : t_idx + chunk_size]
+                zeta_phys = torch.cat([noisy_prev_zeta.unsqueeze(0), sim_chunk], dim=0)  # [2,N,1]
+                u_phys    = torch.cat([torch.zeros_like(true_prev_zeta).unsqueeze(0), u_chunk], dim=0)
+                v_phys    = torch.cat([torch.zeros_like(true_prev_zeta).unsqueeze(0), v_chunk], dim=0)
+                forcing_phys = forcing_sequence[t_idx - 1 : t_idx + 1]
 
                 phys_loss = compute_swe_physics_loss(
                     zeta_phys, u_phys, v_phys,
