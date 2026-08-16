@@ -79,16 +79,11 @@ def train_model():
             
             data_loss = criterion(sim_chunk, true_zetas[start_t:end_t])
             
-            # === FLOWFM MULTI-STAGE PHYSICS SCHEDULE ===
-            # Epochs 0-10: Data-only (burn-in period for stability)
-            # Epochs 10-20: Ramp up physics weight from 0 to 4.0
-            # Epochs 20+: Full physics optimization (weight 4.0)
-            if epoch < 10:
-                physics_weight = 0.0
-            elif epoch < 20:
-                physics_weight = 4.0 * ((epoch - 10) / 10.0)
-            else:
-                physics_weight = 4.0
+            # For this initial test, we are completely disabling the placeholder Physics Loss.
+            # Because the placeholder just penalized spatial and temporal gradients without 
+            # balancing them against wind stress, it mathematically forced the model to 
+            # predict a perfectly flat, still ocean!
+            physics_weight = 0.0
                 
             # Physics Loss: Enforces SWE continuity (mass conservation) and spatial smoothness
             if physics_weight > 0:
