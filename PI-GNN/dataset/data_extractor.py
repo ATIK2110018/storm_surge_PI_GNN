@@ -183,6 +183,25 @@ def create_full_simulation_dataset(f14, f22, f63):
     nodes, elements, open_boundary_nodes = load_adcirc_mesh(f14)
     edge_index = create_graph_edges(elements)
     
+    # Precompute edge geometry ONCE for pressure gradient scatter
+    # (same edges used later for edge_weight; done here in numpy for speed)
+    src_np = edge_index[0].numpy()
+    dst_np = edge_index[1].numpy()
+    cos_lat_val = np.cos(np.radians(np.mean(nodes[:, 1])))
+    _lon_m = 111320.0 * cos_lat_val   # m per degree longitude
+    _lat_m = 110540.0                  # m per degree latitude
+    _dx = (nodes[dst_np, 0] - nodes[src_np, 0]) * _lon_m
+    _dy = (nodes[dst_np, 1] - nodes[src_np, 1]) * _lat_m
+    _dist = np.sqrt(_dx**2 + _dy**2 + 1e-6)
+    _cos_e = _dx / _dist
+    _sin_e = _dy / _dist
+    _inv_e = 1.0 / _dist
+    _N = len(nodes)
+    _degree = np.zeros(_N)
+    np.add.at(_degree, src_np, 1)
+    np.add.at(_degree, dst_np, 1)
+    _degree = np.maximum(_degree, 1.0)
+    
     # Load Target Data (ONLY for loss)
     print("Loading fort.63.nc to generate target loss arrays...")
     ds63 = nc.Dataset(f63)
@@ -249,15 +268,33 @@ def create_full_simulation_dataset(f14, f22, f63):
         
         p_field, u_field, v_field = holland_wind_model(lons, lats, lon, lat, vmax, pc)
         
-        f_depth = depth.squeeze()
-        f_press = torch.tensor(p_field, dtype=torch.float32)
-        # Note: windu and windv are now technically tau_x and tau_y (Wind Stress)
-        f_windu = torch.tensor(u_field, dtype=torch.float32)
-        f_windv = torch.tensor(v_field, dtype=torch.float32)
-        f_n = mannings_n.squeeze()
+        # ============================================================
+        # Pressure GRADIENT (Pa/m) — the actual hydrodynamic forcing.
+        # Raw pressure at a node is meaningless; only ∂P/∂x drives water.
+        # Computed via FD scatter on the mesh graph (same operator as
+        # the physics loss): ∂P/∂x_i = Σ_j (P_j-P_i)·cos_θ·inv_dist / deg_i
+        # ============================================================
+        p_pa = p_field * 100.0           # mb → Pa
+        dp_edge = p_pa[dst_np] - p_pa[src_np]   # [E]
+        grad_px = np.zeros(_N)
+        grad_py = np.zeros(_N)
+        np.add.at(grad_px, dst_np, -dp_edge * _cos_e * _inv_e)
+        np.add.at(grad_px, src_np,  dp_edge * _cos_e * _inv_e)
+        np.add.at(grad_py, dst_np, -dp_edge * _sin_e * _inv_e)
+        np.add.at(grad_py, src_np,  dp_edge * _sin_e * _inv_e)
+        grad_px /= _degree    # Pa/m  x-direction
+        grad_py /= _degree    # Pa/m  y-direction
         
-        # Now 5 Features: Depth, Pressure, Tau_X, Tau_Y, Manning's N
-        feat_t = torch.stack([f_depth, f_press, f_windu, f_windv, f_n], dim=1)
+        f_depth   = depth.squeeze()
+        f_grad_px = torch.tensor(grad_px, dtype=torch.float32)   # ∂P/∂x  [Pa/m]
+        f_grad_py = torch.tensor(grad_py, dtype=torch.float32)   # ∂P/∂y  [Pa/m]
+        # u_field / v_field from holland_wind_model are already τ_x / τ_y [Pa]
+        f_tau_x   = torch.tensor(u_field, dtype=torch.float32)
+        f_tau_y   = torch.tensor(v_field, dtype=torch.float32)
+        f_n       = mannings_n.squeeze()
+        
+        # 6 Features: Depth, dP/dx, dP/dy, τ_x, τ_y, Manning's N
+        feat_t = torch.stack([f_depth, f_grad_px, f_grad_py, f_tau_x, f_tau_y, f_n], dim=1)
         forcing_sequence.append(feat_t)
         
     forcing_sequence = torch.stack(forcing_sequence, dim=0) # [time_steps, num_nodes, 4]

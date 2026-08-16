@@ -83,9 +83,11 @@ def compute_swe_physics_loss(zeta_chunk, u_chunk, v_chunk, forcing_chunk,
 
     # Forcing at the later timestep
     depth      = forcing_chunk[1:, :, 0:1]   # [Tm1, N, 1]
-    tau_x_wind = forcing_chunk[1:, :, 2:3]   # wind stress x  [Pa]
-    tau_y_wind = forcing_chunk[1:, :, 3:4]   # wind stress y  [Pa]
-    mannings_n = forcing_chunk[1:, :, 4:5]
+    dPdx_atm   = forcing_chunk[1:, :, 1:2]   # ∂P/∂x  [Pa/m]  ← pre-computed gradient
+    dPdy_atm   = forcing_chunk[1:, :, 2:3]   # ∂P/∂y  [Pa/m]
+    tau_x_wind = forcing_chunk[1:, :, 3:4]   # wind stress x  [Pa]
+    tau_y_wind = forcing_chunk[1:, :, 4:5]   # wind stress y  [Pa]
+    mannings_n = forcing_chunk[1:, :, 5:6]
 
     H       = torch.clamp(depth + zeta, min=0.05)          # total water depth [m]
     Cf      = (g * mannings_n**2) / (H**(1.0/3.0) + 1e-8) # Manning friction coefficient
@@ -130,13 +132,20 @@ def compute_swe_physics_loss(zeta_chunk, u_chunk, v_chunk, forcing_chunk,
     # ------------------------------------------------------------------
     # Momentum residuals (with wind stress source term)
     # ------------------------------------------------------------------
-    wind_x = tau_x_wind / (rho_water * H + 1e-8)   # wind forcing [m/s²]
+    # ------------------------------------------------------------------
+    # X-Momentum:  dU/dt + g·∂ζ/∂x + (1/ρ_w)·∂P/∂x = τ_x/(ρ_w·H) - Cf·U·|U|/H
+    # The (1/ρ_w)·∂P/∂x term is the inverse barometer: pressure at storm eye
+    # drops ~50 mb → forces ~0.5 m surge even before wind arrives.
+    # ------------------------------------------------------------------
+    wind_x = tau_x_wind / (rho_water * H + 1e-8)          # wind forcing [m/s²]
     wind_y = tau_y_wind / (rho_water * H + 1e-8)
-    fric_x = Cf * u * vel_mag / (H + 1e-8)          # bottom friction [m/s²]
+    baro_x = dPdx_atm   / (rho_water + 1e-8)              # barometric forcing [m/s²]
+    baro_y = dPdy_atm   / (rho_water + 1e-8)
+    fric_x = Cf * u * vel_mag / (H + 1e-8)                # bottom friction [m/s²]
     fric_y = Cf * v * vel_mag / (H + 1e-8)
 
-    R_mom_x = du_dt + g * grad_zeta_x - wind_x + fric_x
-    R_mom_y = dv_dt + g * grad_zeta_y - wind_y + fric_y
+    R_mom_x = du_dt + g * grad_zeta_x + baro_x - wind_x + fric_x
+    R_mom_y = dv_dt + g * grad_zeta_y + baro_y - wind_y + fric_y
 
     # Weight: continuity is the primary constraint; momentum scaled down
     return (torch.mean(R_cont**2) +

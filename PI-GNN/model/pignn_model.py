@@ -83,8 +83,8 @@ class ParametricPIGNN(torch.nn.Module):
             forcing_t = forcing_sequence[t] # [num_nodes, 5]
             
             # === ADCIRC EXACT PHYSICS ===
-            depth = forcing_t[:, 0:1]
-            mannings_n = forcing_t[:, 4:5]
+            depth      = forcing_t[:, 0:1]
+            mannings_n = forcing_t[:, 5:6]   # col 5 = Manning's n (layout: Depth,dPx,dPy,tx,ty,n)
             
             # Nominal Depth for Friction (no previous zeta available)
             H_approx = torch.clamp(depth, min=0.1) 
@@ -92,8 +92,9 @@ class ParametricPIGNN(torch.nn.Module):
             # Exact ADCIRC Bottom Friction Coefficient (Cf)
             Cf = (9.81 * mannings_n**2) / (H_approx**(1/3))
             
-            # Replace raw Manning's n with the mathematically exact Cf
-            physical_forcing = torch.cat([forcing_t[:, 0:4], Cf], dim=1)
+            # Replace Manning's n (col 5) with the derived Cf.
+            # physical_forcing: [Depth, dP/dx, dP/dy, tau_x, tau_y, Cf] = 6 cols
+            physical_forcing = torch.cat([forcing_t[:, 0:5], Cf], dim=1)
             
             # Combine SPATIAL parameters (X, Y) with physical forcing (Depth, Pressure, Wind, Cf) and PREVIOUS STATE
             node_feat = torch.cat([xy_features, physical_forcing, prev_state], dim=1)
