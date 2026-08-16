@@ -57,9 +57,10 @@ class ParametricPIGNN(torch.nn.Module):
             GNNLayer(hidden_dim, 16) for _ in range(n_layers)
         ])
 
-        # Output: ABSOLUTE state (Zeta, U, V) directly.
-        # Delta-prediction was biased toward 0 and caused drift at inference time.
-        # Absolute prediction forces the model to output physically plausible values.
+        # Output: DELTA state (dZeta, dU, dV) - residual over prev_state.
+        # Delta prediction is more numerically stable: the model only needs to learn
+        # small corrections (~0.01m per 15min step) rather than absolute values.
+        # Drift is prevented by the 2-step scheduled sampling in the training loop.
         self.decoder = _mlp(hidden_dim, hidden_dim, 3)
 
     def forward(self, forcing_sequence, edge_index, edge_weight, nodes_xy, open_boundary_nodes=None, boundary_tides=None, initial_states=None):
@@ -124,13 +125,13 @@ class ParametricPIGNN(torch.nn.Module):
             for layer in self.gnn_layers:
                 h = layer(h, src, dst, e)
                 
-            # Predict ABSOLUTE state directly (not delta).
-            # Delta prediction biases the model toward zero output and causes
-            # monotonic drift at inference time on long autoregressive sequences.
+            # Predict DELTA state (residual over prev_state).
+            # This is numerically stable: the model only learns small corrections
+            # per 15-min step. Drift is prevented by 2-step scheduled sampling.
             preds = self.decoder(h)
-            zeta_t = preds[:, 0:1]   # absolute zeta
-            u_t    = preds[:, 1:2]   # absolute u
-            v_t    = preds[:, 2:3]   # absolute v
+            zeta_t = prev_state[:, 0:1] + preds[:, 0:1]
+            u_t    = prev_state[:, 1:2] + preds[:, 1:2]
+            v_t    = prev_state[:, 2:3] + preds[:, 2:3]
 
             # Clamp water level to physically plausible range
             zeta_t = torch.clamp(zeta_t, min=-10.0, max=15.0)

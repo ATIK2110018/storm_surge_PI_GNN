@@ -107,43 +107,69 @@ def train_model():
         for step, t_idx in enumerate(t_sample):
             optimizer.zero_grad()
 
-            true_prev_zeta = true_zetas[t_idx - 1]       # [N, 1]
-            noise = torch.randn_like(true_prev_zeta) * 0.05
-            noisy_prev_zeta = true_prev_zeta + noise
-            
-            prev_state = torch.cat([
-                noisy_prev_zeta,
-                torch.zeros_like(true_prev_zeta),          # U₀ = 0
-                torch.zeros_like(true_prev_zeta),          # V₀ = 0
-            ], dim=1)                                      # [N, 3]
+            # ----------------------------------------------------------------
+            # 2-STEP SCHEDULED SAMPLING (Pushforward Trick)
+            # ----------------------------------------------------------------
+            # STEP 1: Start from noisy true state → predict zeta at t_idx
+            # STEP 2: Feed model's OWN step-1 output (detached) → predict t+1
+            # Loss at BOTH steps. This forces the model to experience its own
+            # prediction errors during training, closing the train/inference gap
+            # that caused monotonic drift. Memory cost = 2 × 1-step (no OOM).
+            # ----------------------------------------------------------------
+            t2 = t_idx + 1
+            if t2 >= split_idx:
+                t2 = t_idx  # Stay in bounds; only use step 1 at boundary
 
-            # Run 1 time step (chunk_size=1 to fit in 15GB GPU VRAM)
-            sim_chunk, u_chunk, v_chunk, _ = model(
+            # --- Step 1 ---
+            true_prev_zeta = true_zetas[t_idx - 1]           # [N, 1]
+            noise = torch.randn_like(true_prev_zeta) * 0.05
+            prev_state_1 = torch.cat([
+                true_prev_zeta + noise,
+                torch.zeros_like(true_prev_zeta),
+                torch.zeros_like(true_prev_zeta),
+            ], dim=1)                                          # [N, 3]
+
+            sim_1, u_1, v_1, _ = model(
                 forcing_sequence[t_idx : t_idx + 1],
-                edge_index,
-                edge_weight,
-                nodes_xy_t,
+                edge_index, edge_weight, nodes_xy_t,
                 open_boundary_nodes,
                 boundary_tides[t_idx : t_idx + 1] if boundary_tides is not None else None,
-                prev_state,
+                prev_state_1,
             )
 
-            # Masked MSE loss
-            mask_t = wet_mask[t_idx].unsqueeze(0).unsqueeze(-1).float()  # [1, N, 1]
-            n_wet  = mask_t.sum().clamp(min=1.0)
-            data_loss = ((sim_chunk - true_zetas[t_idx : t_idx + 1])**2 * mask_t).sum() / n_wet
+            mask_1 = wet_mask[t_idx].unsqueeze(0).unsqueeze(-1).float()
+            n_wet_1 = mask_1.sum().clamp(min=1.0)
+            loss_1 = ((sim_1 - true_zetas[t_idx : t_idx + 1])**2 * mask_1).sum() / n_wet_1
 
-            # Physics loss: prepend the (noisy) prev state to build a [2,N,1] window
+            # --- Step 2: feed model's OWN output (detached — no extra backprop graph) ---
+            prev_state_2 = torch.cat([
+                sim_1.detach(),                               # Model's prediction, not ground truth
+                u_1.detach(),
+                v_1.detach(),
+            ], dim=1)
+
+            sim_2, u_2, v_2, _ = model(
+                forcing_sequence[t2 : t2 + 1],
+                edge_index, edge_weight, nodes_xy_t,
+                open_boundary_nodes,
+                boundary_tides[t2 : t2 + 1] if boundary_tides is not None else None,
+                prev_state_2,
+            )
+
+            mask_2 = wet_mask[t2].unsqueeze(0).unsqueeze(-1).float()
+            n_wet_2 = mask_2.sum().clamp(min=1.0)
+            loss_2 = ((sim_2 - true_zetas[t2 : t2 + 1])**2 * mask_2).sum() / n_wet_2
+
+            data_loss = (loss_1 + loss_2) * 0.5
+
+            # Physics loss on step 1 window [t-1, t]
             if phys_weight > 0.0:
-                zeta_phys = torch.cat([noisy_prev_zeta.unsqueeze(0), sim_chunk], dim=0)  # [2,N,1]
-                u_phys    = torch.cat([torch.zeros_like(true_prev_zeta).unsqueeze(0), u_chunk], dim=0)
-                v_phys    = torch.cat([torch.zeros_like(true_prev_zeta).unsqueeze(0), v_chunk], dim=0)
-                forcing_phys = forcing_sequence[t_idx - 1 : t_idx + 1]
-
+                zeta_phys = torch.cat([(true_prev_zeta + noise).unsqueeze(0), sim_1], dim=0)
+                u_phys    = torch.cat([torch.zeros_like(true_prev_zeta).unsqueeze(0), u_1], dim=0)
+                v_phys    = torch.cat([torch.zeros_like(true_prev_zeta).unsqueeze(0), v_1], dim=0)
                 phys_loss = compute_swe_physics_loss(
                     zeta_phys, u_phys, v_phys,
-                    forcing_phys, edge_index, nodes_xy_t,
-                    dt=900.0,
+                    forcing_sequence[t_idx - 1 : t_idx + 1], edge_index, nodes_xy_t, dt=900.0,
                 )
             else:
                 phys_loss = torch.tensor(0.0, device=device)
