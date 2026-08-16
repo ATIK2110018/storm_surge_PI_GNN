@@ -42,19 +42,24 @@ class ParametricPIGNN(torch.nn.Module):
         # node_in = XY(2) + physics(num_forcing_features) + prev_state(3)
         node_in_channels = 2 + num_forcing_features + 3
 
-        # FIX: LayerNorm instead of BatchNorm1d.
-        # BatchNorm uses running statistics that diverge between train and eval,
-        # corrupting features during single-step inference.
-        self.feature_norm = nn.LayerNorm(node_in_channels)
+        # FIXED: Removed LayerNorm on input features.
+        # LayerNorm normalizes across feature dimensions per-node. At inference time
+        # with a single continuous sequence, the running stats are completely different
+        # from the random 4-step training windows, causing catastrophic feature shift.
+        # Instead we use a learnable per-feature scale+bias (equivalent to an affine
+        # layer with no normalization dependency on batch statistics).
+        self.feature_scale = nn.Parameter(torch.ones(node_in_channels))
+        self.feature_bias  = nn.Parameter(torch.zeros(node_in_channels))
         self.node_encoder = _mlp(node_in_channels, hidden_dim, hidden_dim)
         self.edge_encoder = _mlp(1, 16, 16)
 
-        # FIX: n_layers=4, hidden_dim=64 (was 3/32 - too shallow for 30k-node domain)
         self.gnn_layers = nn.ModuleList([
             GNNLayer(hidden_dim, 16) for _ in range(n_layers)
         ])
 
-        # Output: delta-state (dZeta, dU, dV) - residual over prev_state
+        # Output: ABSOLUTE state (Zeta, U, V) directly.
+        # Delta-prediction was biased toward 0 and caused drift at inference time.
+        # Absolute prediction forces the model to output physically plausible values.
         self.decoder = _mlp(hidden_dim, hidden_dim, 3)
 
     def forward(self, forcing_sequence, edge_index, edge_weight, nodes_xy, open_boundary_nodes=None, boundary_tides=None, initial_states=None):
@@ -111,21 +116,23 @@ class ParametricPIGNN(torch.nn.Module):
             # Combine SPATIAL parameters (X, Y) with physical forcing (Depth, Pressure, Wind, Cf) and PREVIOUS STATE
             node_feat = torch.cat([xy_features, physical_forcing, prev_state], dim=1)
             
-            # Normalize all features dynamically to prevent static variables from drowning out wind stress!
-            node_feat = self.feature_norm(node_feat)
+            # Apply learnable per-feature affine scaling (no batch-stat dependency)
+            node_feat = node_feat * self.feature_scale + self.feature_bias
             
             # === DEEP MESSAGE PASSING ===
             h = self.node_encoder(node_feat)
             for layer in self.gnn_layers:
                 h = layer(h, src, dst, e)
                 
-            # Predict the CHANGE in state (physically: Euler integration step)
+            # Predict ABSOLUTE state directly (not delta).
+            # Delta prediction biases the model toward zero output and causes
+            # monotonic drift at inference time on long autoregressive sequences.
             preds = self.decoder(h)
-            zeta_t = prev_state[:, 0:1] + preds[:, 0:1]
-            u_t    = prev_state[:, 1:2] + preds[:, 1:2]
-            v_t    = prev_state[:, 2:3] + preds[:, 2:3]
+            zeta_t = preds[:, 0:1]   # absolute zeta
+            u_t    = preds[:, 1:2]   # absolute u
+            v_t    = preds[:, 2:3]   # absolute v
 
-            # Clamp water level to physically plausible range (prevents runaway residuals)
+            # Clamp water level to physically plausible range
             zeta_t = torch.clamp(zeta_t, min=-10.0, max=15.0)
 
             # === DYNAMIC WETTING & DRYING (WD) ALGORITHM ===
