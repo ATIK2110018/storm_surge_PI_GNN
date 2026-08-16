@@ -57,7 +57,10 @@ def train_model():
         # === TRAINING PHASE ===
         model.train()
         total_train_loss = 0
-        chunk_size = 24
+        # The deep 128-dimensional Parametric GNN has ~5x the parameters and vastly more 
+        # intermediate edge activations than the old simple GCN. 
+        # We must drop the mini-batch chunk_size significantly to prevent CUDA OOM.
+        chunk_size = 2
         num_train_chunks = 0
         
         for start_t in range(0, split_idx, chunk_size):
