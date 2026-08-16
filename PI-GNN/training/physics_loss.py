@@ -151,10 +151,17 @@ def compute_swe_physics_loss(zeta_chunk, u_chunk, v_chunk, forcing_chunk,
     R_mom_x = du_dt + g * grad_zeta_x + baro_x - wind_x + fric_x
     R_mom_y = dv_dt + g * grad_zeta_y + baro_y - wind_y + fric_y
 
+    # FIX: The residuals are accelerations/velocities (m/s or m/s^2).
+    # Typical continuity values are ~1e-4 m/s. Squared they are ~1e-8 (vanishes!).
+    # We must scale them to O(1) before squaring so the loss is visible.
+    R_cont_scaled = R_cont * 10000.0   # Scale up by 1e4
+    R_mom_x_scaled = R_mom_x * 1000.0  # Scale up by 1e3
+    R_mom_y_scaled = R_mom_y * 1000.0
+
     # Weight: continuity is the primary constraint; momentum scaled down
-    return (torch.mean(R_cont**2) +
-            0.1 * torch.mean(R_mom_x**2) +
-            0.1 * torch.mean(R_mom_y**2))
+    return (torch.mean(R_cont_scaled**2) +
+            0.1 * torch.mean(R_mom_x_scaled**2) +
+            0.1 * torch.mean(R_mom_y_scaled**2))
 
 
 # ---------------------------------------------------------------------------
