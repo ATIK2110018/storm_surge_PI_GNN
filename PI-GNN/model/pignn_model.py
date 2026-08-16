@@ -136,16 +136,18 @@ class ParametricPIGNN(torch.nn.Module):
             lag_feats = []
             for k in range(self.n_lags):
                 lag_t = max(0, global_t - k)
-                # cols 1:6 = [dP/dx, dP/dy, tau_x, tau_y, mean_bt]
-                # mean_bt (col 4 after slicing) is CRITICAL: it tells the model the tidal phase!
-                raw_lag = forcing_sequence[lag_t, :, 1:6].clone()
+                # Extract lag features: [dP/dx (1), dP/dy (2), tau_x (3), tau_y (4), mean_bt (6)]
+                # mean_bt is CRITICAL: it tells the model the tidal phase!
+                # (We skip column 5 because it is Manning's n, which is constant and not a lag feature)
+                cols = [1, 2, 3, 4, 6]
+                raw_lag = forcing_sequence[lag_t, :, cols].clone()
                 
                 # Apply fixed physical scaling to normalize features for the MLP
                 raw_lag[:, 0] *= 100.0   # dP/dx (typically very small, ~0.01)
                 raw_lag[:, 1] *= 100.0   # dP/dy
                 raw_lag[:, 2] *= 0.2     # tau_x (typically up to ~5)
                 raw_lag[:, 3] *= 0.2     # tau_y
-                # raw_lag[:, 4] is mean_bt, typically -2 to 2, no scaling needed
+                # raw_lag[:, 4] is mean_bt (column 6), typically -2 to 2, no scaling needed
                 
                 lag_feats.append(raw_lag)  # [N, 5]
             lagged = torch.cat(lag_feats, dim=1)  # [N, n_lags*5]
