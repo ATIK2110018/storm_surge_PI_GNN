@@ -144,38 +144,45 @@ def holland_wind_model(lons, lats, storm_lon, storm_lat, vmax_knots, pc_mb, pn_m
     rho_air, e, omega = 1.15, np.exp(1), 7.2921e-5
     r_km = np.maximum(haversine_distance(lons, lats, storm_lon, storm_lat), 0.1)
     r_meters = r_km * 1000.0
-    theta = np.arctan2(np.radians(lats - storm_lat), np.radians(lons - storm_lon))
+
+    # FIX: Use metric Cartesian coordinates for bearing, not raw degree differences.
+    # Raw degrees are not isometric: 1 deg lon != 1 deg lat in metres at lat != 0.
+    cos_lat_s = np.cos(np.radians(storm_lat))
+    dx_m = (lons - storm_lon) * 111320.0 * cos_lat_s
+    dy_m = (lats - storm_lat) * 110540.0
+    theta = np.arctan2(dy_m, dx_m)
+
     f = 2 * omega * np.sin(np.radians(lats))
-    
+
     vmax_ms = vmax_knots * 0.514444
     rmax_meters = np.maximum(47.0 - 0.41 * (pn_mb - pc_mb), 15.0) * 1000.0
-    
+
     delta_p_pa = (pn_mb - pc_mb) * 100.0
-    if delta_p_pa <= 0: return np.full_like(lons, pn_mb), np.zeros_like(lons), np.zeros_like(lons)
-        
+    if delta_p_pa <= 0:
+        return np.full_like(lons, pn_mb), np.zeros_like(lons), np.zeros_like(lons)
+
     B = np.clip((vmax_ms**2 * rho_air * e) / delta_p_pa, 1.0, 2.5)
-    
+
     pressure_field = pc_mb + (pn_mb - pc_mb) * np.exp(-1.0 * (rmax_meters / r_meters)**B)
-    
-    term1 = (B / rho_air) * delta_p_pa * (rmax_meters / r_meters)**B * np.exp(-1.0 * (rmax_meters / r_meters)**B)
+
+    term1 = (B / rho_air) * delta_p_pa * (rmax_meters / r_meters)**B * np.exp(
+        -1.0 * (rmax_meters / r_meters)**B)
     term2 = (r_meters * f / 2.0)**2
-    v_gradient = np.sqrt(term1 + term2) - (r_meters * np.abs(f) / 2.0)
-    
-    # Convert scalar wind to U, V components (inflowing cyclonic swirl)
+    v_gradient = np.sqrt(np.maximum(term1 + term2, 0.0)) - (r_meters * np.abs(f) / 2.0)
+    # FIX: v_gradient must be >= 0. Far from the eye, the Coriolis subtraction
+    # can make it negative, reversing wind direction entirely.
+    v_gradient = np.maximum(v_gradient, 0.0)
+
     inflow_angle = np.radians(15.0)
     wind_u = -v_gradient * np.sin(theta + inflow_angle)
-    wind_v = v_gradient * np.cos(theta + inflow_angle)
-    
-    # === EXPLICIT WIND STRESS CONVERSION ===
-    # Garratt's Drag Coefficient Formula
+    wind_v =  v_gradient * np.cos(theta + inflow_angle)
+
+    # Garratt (1977) drag coefficient → wind stress [Pa]
     wind_mag = np.sqrt(wind_u**2 + wind_v**2)
-    Cd = (0.75 + 0.067 * wind_mag) * 1e-3
-    Cd = np.clip(Cd, 0.0, 0.0035) # Cap drag at extreme hurricane speeds
-    
-    # Wind Stress (tau)
+    Cd = np.clip((0.75 + 0.067 * wind_mag) * 1e-3, 0.0, 0.0035)
     tau_x = Cd * rho_air * wind_u * wind_mag
     tau_y = Cd * rho_air * wind_v * wind_mag
-    
+
     return pressure_field, tau_x, tau_y
 
 def create_full_simulation_dataset(f14, f22, f63):
@@ -206,26 +213,31 @@ def create_full_simulation_dataset(f14, f22, f63):
     print("Loading fort.63.nc to generate target loss arrays...")
     ds63 = nc.Dataset(f63)
     orig_t_seconds = ds63.variables['time'][:]
-    orig_zeta = ds63.variables['zeta'][:]
+    orig_zeta = ds63.variables['zeta'][:]   # masked array
     ds63.close()
-    orig_zeta = np.ma.filled(orig_zeta, 0.0)
-    
-    # === STRICT 15-MINUTE INTEGRATION TIMESTEP ===
-    # Reduced from 5 minutes to 15 minutes to prevent PyTorch CUDA Out Of Memory (OOM).
-    # 15 minutes still guarantees high integration stability while using 1/3rd the VRAM.
+    # FIX: Fill dry/land nodes with -9999.0 sentinel (NOT 0.0).
+    # Filling with 0.0 incorrectly trains the model to predict sea-level
+    # at land nodes, polluting the loss with ~50% meaningless targets.
+    orig_zeta = np.ma.filled(orig_zeta, -9999.0)
+
     dt_seconds = 900.0
     start_time = orig_t_seconds[0]
-    end_time = orig_t_seconds[-1]
+    end_time   = orig_t_seconds[-1]
     t_seconds_5min = np.arange(start_time, end_time, dt_seconds)
     time_steps = len(t_seconds_5min)
-    
-    print(f"Decoupling temporal resolution... Generating dense 5-minute intervals ({time_steps} steps)...")
-    
+
+    print(f"Generating 15-min interpolated timeline ({time_steps} steps)...")
+
     from scipy.interpolate import interp1d
-    # Interpolate the ground truth answers so we can calculate loss at every 5-min step
     interp_func_zeta = interp1d(orig_t_seconds, orig_zeta, axis=0, fill_value="extrapolate")
     zeta_5min = interp_func_zeta(t_seconds_5min)
-    true_zetas = torch.tensor(zeta_5min, dtype=torch.float32).unsqueeze(2) # [time_steps, num_nodes, 1]
+
+    # Build wet mask BEFORE zeroing dry nodes.
+    # A node is considered wet if it has a valid water level (> -9000).
+    wet_mask_np = zeta_5min > -9000.0          # [T, N]  True = wet
+    zeta_5min[~wet_mask_np] = 0.0              # zero out sentinels for numerics
+    true_zetas = torch.tensor(zeta_5min, dtype=torch.float32).unsqueeze(2)  # [T, N, 1]
+    wet_mask   = torch.tensor(wet_mask_np, dtype=torch.bool)                 # [T, N]
     
     track_data = parse_fort22(f22)
     
@@ -309,6 +321,7 @@ def create_full_simulation_dataset(f14, f22, f63):
     dst = edge_index[1].numpy()
     dists = haversine(nodes[src, 0], nodes[src, 1], nodes[dst, 0], nodes[dst, 1])
     dists = np.clip(dists, 1.0, None) # Prevent divide by zero
-    edge_weight = torch.tensor(1.0 / dists, dtype=torch.float32) # Inverse distance weighting
-    
-    return forcing_sequence, edge_index, edge_weight, true_zetas, open_boundary_nodes, boundary_tides, nodes
+    edge_weight = torch.tensor(1.0 / dists, dtype=torch.float32)
+
+    return (forcing_sequence, edge_index, edge_weight, true_zetas,
+            open_boundary_nodes, boundary_tides, nodes, wet_mask)

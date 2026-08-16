@@ -36,23 +36,25 @@ class GNNLayer(nn.Module):
         return self.norm(h + h_new)
 
 class ParametricPIGNN(torch.nn.Module):
-    def __init__(self, num_nodes, num_forcing_features=5, hidden_dim=32, n_layers=3):
+    def __init__(self, num_nodes, num_forcing_features=6, hidden_dim=64, n_layers=4):
         super(ParametricPIGNN, self).__init__()
-        
-        # Spatial inputs (X, Y) = 2
-        # Physical forcing features (Depth, Pressure, TauX, TauY, Cf) = 5
-        # Previous State (Zeta, U, V) = 3
+
+        # node_in = XY(2) + physics(num_forcing_features) + prev_state(3)
         node_in_channels = 2 + num_forcing_features + 3
-        
-        self.feature_norm = nn.BatchNorm1d(node_in_channels)
+
+        # FIX: LayerNorm instead of BatchNorm1d.
+        # BatchNorm uses running statistics that diverge between train and eval,
+        # corrupting features during single-step inference.
+        self.feature_norm = nn.LayerNorm(node_in_channels)
         self.node_encoder = _mlp(node_in_channels, hidden_dim, hidden_dim)
-        self.edge_encoder = _mlp(1, 8, 8) # Encode scalar edge_weight (inverse dist)
-        
+        self.edge_encoder = _mlp(1, 16, 16)
+
+        # FIX: n_layers=4, hidden_dim=64 (was 3/32 - too shallow for 30k-node domain)
         self.gnn_layers = nn.ModuleList([
-            GNNLayer(hidden_dim, 8) for _ in range(n_layers)
+            GNNLayer(hidden_dim, 16) for _ in range(n_layers)
         ])
-        
-        # Output: delta-state (dZeta, dU, dV) — residual over prev_state
+
+        # Output: delta-state (dZeta, dU, dV) - residual over prev_state
         self.decoder = _mlp(hidden_dim, hidden_dim, 3)
 
     def forward(self, forcing_sequence, edge_index, edge_weight, nodes_xy, open_boundary_nodes=None, boundary_tides=None, initial_states=None):
@@ -61,8 +63,8 @@ class ParametricPIGNN(torch.nn.Module):
         device = forcing_sequence.device
         
         src, dst = edge_index[0], edge_index[1]
-        
-        # Edge features: expand edge_weight to [N_edges, 1] and encode
+
+        # Encode edge weights (inverse distances) with the updated 16-dim encoder
         e_feat_raw = edge_weight.unsqueeze(1)
         e = self.edge_encoder(e_feat_raw)
         
@@ -84,15 +86,15 @@ class ParametricPIGNN(torch.nn.Module):
             
             # === ADCIRC EXACT PHYSICS ===
             depth      = forcing_t[:, 0:1]
-            mannings_n = forcing_t[:, 5:6]   # col 5 = Manning's n (layout: Depth,dPx,dPy,tx,ty,n)
-            
-            # Nominal Depth for Friction (no previous zeta available)
-            H_approx = torch.clamp(depth, min=0.1) 
-            
-            # Exact ADCIRC Bottom Friction Coefficient (Cf)
-            Cf = (9.81 * mannings_n**2) / (H_approx**(1/3))
-            
-            # Replace Manning's n (col 5) with the derived Cf.
+            mannings_n = forcing_t[:, 5:6]
+
+            # FIX: Use DYNAMIC total water depth H = depth + zeta_prev.
+            # Static depth ignores surge-induced depth change, freezing Cf at
+            # a wrong pre-storm value and breaking the depth-friction feedback.
+            zeta_prev  = prev_state[:, 0:1]
+            H_total    = torch.clamp(depth + zeta_prev, min=0.1)
+            Cf = (9.81 * mannings_n**2) / (H_total**(1.0/3.0))
+
             # physical_forcing: [Depth, dP/dx, dP/dy, tau_x, tau_y, Cf] = 6 cols
             physical_forcing = torch.cat([forcing_t[:, 0:5], Cf], dim=1)
             
