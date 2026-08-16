@@ -77,6 +77,14 @@ class ParametricPIGNN(torch.nn.Module):
             prev_state = torch.zeros((num_nodes, 3), dtype=torch.float32, device=device)
         else:
             prev_state = initial_states
+
+        # BUG 5 FIX: open_boundary_nodes is a numpy array.
+        # GPU tensor indexing requires a LongTensor, not a numpy array.
+        # Convert once here before the time loop.
+        if open_boundary_nodes is not None and len(open_boundary_nodes) > 0:
+            obn = torch.tensor(open_boundary_nodes, dtype=torch.long, device=device)
+        else:
+            obn = None
             
         simulated_zetas = []
         zeta_t, u_t, v_t = None, None, None
@@ -125,11 +133,9 @@ class ParametricPIGNN(torch.nn.Module):
             v_t = v_t * wd_mask
 
             # === EXPLICIT TIDAL BOUNDARY FORCING (Dirichlet BC) ===
-            # boundary_tides[t] shape: [num_bnodes] — each boundary node gets its
-            # own individual tidal amplitude from fort.15 harmonic constituents.
-            if open_boundary_nodes is not None and boundary_tides is not None:
-                zeta_t = zeta_t.clone()  # avoid in-place op on computation graph
-                zeta_t[open_boundary_nodes, 0] = boundary_tides[t]
+            if obn is not None and boundary_tides is not None:
+                zeta_t = zeta_t.clone()
+                zeta_t[obn, 0] = boundary_tides[t]
                 
             prev_state = torch.cat([zeta_t, u_t, v_t], dim=1)
             simulated_zetas.append(zeta_t)

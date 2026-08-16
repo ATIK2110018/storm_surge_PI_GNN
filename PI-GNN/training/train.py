@@ -198,7 +198,11 @@ def train_model():
                     boundary_tides[start_t:end_t] if boundary_tides is not None else None,
                     current_state,
                 )
-                val_loss_total += criterion(sim_val, true_zetas[start_t:end_t]).item()
+                # Apply same wet_mask as training so val loss is directly comparable
+                vmask_t = wet_mask[start_t:end_t].unsqueeze(-1).float()  # [chunk, N, 1]
+                n_wet_v  = vmask_t.sum().clamp(min=1.0)
+                v_loss = ((sim_val - true_zetas[start_t:end_t])**2 * vmask_t).sum() / n_wet_v
+                val_loss_total += v_loss.item()
                 val_chunks     += 1
 
         avg_val = val_loss_total / max(val_chunks, 1)

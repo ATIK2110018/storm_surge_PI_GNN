@@ -190,13 +190,15 @@ def create_full_simulation_dataset(f14, f22, f63):
     nodes, elements, open_boundary_nodes = load_adcirc_mesh(f14)
     edge_index = create_graph_edges(elements)
     
-    # Precompute edge geometry ONCE for pressure gradient scatter
-    # (same edges used later for edge_weight; done here in numpy for speed)
+    # ------------------------------------------------------------------
+    # Precompute edge geometry + sparse scatter matrices for pressure gradients
+    # ------------------------------------------------------------------
+    from scipy.sparse import csr_matrix as _csr
     src_np = edge_index[0].numpy()
     dst_np = edge_index[1].numpy()
     cos_lat_val = np.cos(np.radians(np.mean(nodes[:, 1])))
-    _lon_m = 111320.0 * cos_lat_val   # m per degree longitude
-    _lat_m = 110540.0                  # m per degree latitude
+    _lon_m = 111320.0 * cos_lat_val
+    _lat_m = 110540.0
     _dx = (nodes[dst_np, 0] - nodes[src_np, 0]) * _lon_m
     _dy = (nodes[dst_np, 1] - nodes[src_np, 1]) * _lat_m
     _dist = np.sqrt(_dx**2 + _dy**2 + 1e-6)
@@ -204,40 +206,55 @@ def create_full_simulation_dataset(f14, f22, f63):
     _sin_e = _dy / _dist
     _inv_e = 1.0 / _dist
     _N = len(nodes)
-    _degree = np.zeros(_N)
-    np.add.at(_degree, src_np, 1)
-    np.add.at(_degree, dst_np, 1)
-    _degree = np.maximum(_degree, 1.0)
+    E  = len(src_np)
+    edge_idx = np.arange(E)
+
+    # BUG 6 FIX: Build sparse [N, E] scatter matrices ONCE.
+    # grad_px = (A_x @ dp_edge) / degree  is a single BLAS call, 100x faster
+    # than np.add.at inside a Python loop.
+    _A_x = _csr(
+        (np.concatenate([-_cos_e * _inv_e,  _cos_e * _inv_e]),
+         (np.concatenate([dst_np, src_np]),  np.concatenate([edge_idx, edge_idx]))),
+        shape=(_N, E), dtype=np.float32)
+    _A_y = _csr(
+        (np.concatenate([-_sin_e * _inv_e,  _sin_e * _inv_e]),
+         (np.concatenate([dst_np, src_np]),  np.concatenate([edge_idx, edge_idx]))),
+        shape=(_N, E), dtype=np.float32)
+
+    _degree = np.maximum(
+        np.bincount(np.concatenate([src_np, dst_np]), minlength=_N).astype(np.float32), 1.0)
     
     # Load Target Data (ONLY for loss)
     print("Loading fort.63.nc to generate target loss arrays...")
     ds63 = nc.Dataset(f63)
-    orig_t_seconds = ds63.variables['time'][:]
-    orig_zeta = ds63.variables['zeta'][:]   # masked array
+    orig_t_seconds = np.array(ds63.variables['time'][:])
+    orig_zeta_ma   = ds63.variables['zeta'][:]   # MaskedArray
     ds63.close()
-    # FIX: Fill dry/land nodes with -9999.0 sentinel (NOT 0.0).
-    # Filling with 0.0 incorrectly trains the model to predict sea-level
-    # at land nodes, polluting the loss with ~50% meaningless targets.
-    orig_zeta = np.ma.filled(orig_zeta, -9999.0)
+
+    # BUG 1 FIX: Never interpolate the -9999 sentinel.
+    # Strategy: interpolate zeta and wet/dry mask independently.
+    #   - zeta values : fill dry nodes with 0.0 BEFORE interp (safe linear interp)
+    #   - wet/dry mask: interpolate with nearest-neighbor so it stays binary
+    # This prevents corrupted intermediate values near inundation zones.
+    orig_wet   = (~np.ma.getmaskarray(orig_zeta_ma)).astype(np.float32)  # 1=wet, 0=dry
+    orig_zeta_filled = np.ma.filled(orig_zeta_ma, 0.0)                   # 0.0 for dry
 
     dt_seconds = 900.0
     start_time = orig_t_seconds[0]
     end_time   = orig_t_seconds[-1]
     t_seconds_5min = np.arange(start_time, end_time, dt_seconds)
     time_steps = len(t_seconds_5min)
-
     print(f"Generating 15-min interpolated timeline ({time_steps} steps)...")
 
     from scipy.interpolate import interp1d
-    interp_func_zeta = interp1d(orig_t_seconds, orig_zeta, axis=0, fill_value="extrapolate")
-    zeta_5min = interp_func_zeta(t_seconds_5min)
-
-    # Build wet mask BEFORE zeroing dry nodes.
-    # A node is considered wet if it has a valid water level (> -9000).
-    wet_mask_np = zeta_5min > -9000.0          # [T, N]  True = wet
-    zeta_5min[~wet_mask_np] = 0.0              # zero out sentinels for numerics
-    true_zetas = torch.tensor(zeta_5min, dtype=torch.float32).unsqueeze(2)  # [T, N, 1]
-    wet_mask   = torch.tensor(wet_mask_np, dtype=torch.bool)                 # [T, N]
+    zeta_5min  = interp1d(orig_t_seconds, orig_zeta_filled, axis=0,
+                          fill_value="extrapolate")(t_seconds_5min)
+    wet_interp = interp1d(orig_t_seconds, orig_wet, axis=0,
+                          kind='nearest', fill_value='extrapolate')(t_seconds_5min)
+    wet_mask_np = wet_interp > 0.5                  # [T, N] bool, clean binary
+    zeta_5min[~wet_mask_np] = 0.0                   # ensure dry nodes stay 0
+    true_zetas = torch.tensor(zeta_5min,  dtype=torch.float32).unsqueeze(2)  # [T,N,1]
+    wet_mask   = torch.tensor(wet_mask_np, dtype=torch.bool)                  # [T,N]
     
     track_data = parse_fort22(f22)
     
@@ -270,46 +287,44 @@ def create_full_simulation_dataset(f14, f22, f63):
     
     lons, lats = nodes[:, 0], nodes[:, 1]
     
-    forcing_sequence = []
-    
+    # ------------------------------------------------------------------
+    # BUG 6 FIX: Vectorized Holland model + pressure gradient computation.
+    # Run all Holland evaluations first, then compute gradients in one
+    # BLAS sparse-matrix call instead of T × np.add.at Python calls.
+    # ------------------------------------------------------------------
+    print(f"Running Holland wind model for {time_steps} timesteps (vectorized)...")
+    p_pa_list  = []   # [T, N]
+    tau_x_list = []
+    tau_y_list = []
     for t in range(time_steps):
-        lon = interp_lons[t]
-        lat = interp_lats[t]
-        vmax = interp_vmax[t]
-        pc = interp_pc[t]
-        
-        p_field, u_field, v_field = holland_wind_model(lons, lats, lon, lat, vmax, pc)
-        
-        # ============================================================
-        # Pressure GRADIENT (Pa/m) — the actual hydrodynamic forcing.
-        # Raw pressure at a node is meaningless; only ∂P/∂x drives water.
-        # Computed via FD scatter on the mesh graph (same operator as
-        # the physics loss): ∂P/∂x_i = Σ_j (P_j-P_i)·cos_θ·inv_dist / deg_i
-        # ============================================================
-        p_pa = p_field * 100.0           # mb → Pa
-        dp_edge = p_pa[dst_np] - p_pa[src_np]   # [E]
-        grad_px = np.zeros(_N)
-        grad_py = np.zeros(_N)
-        np.add.at(grad_px, dst_np, -dp_edge * _cos_e * _inv_e)
-        np.add.at(grad_px, src_np,  dp_edge * _cos_e * _inv_e)
-        np.add.at(grad_py, dst_np, -dp_edge * _sin_e * _inv_e)
-        np.add.at(grad_py, src_np,  dp_edge * _sin_e * _inv_e)
-        grad_px /= _degree    # Pa/m  x-direction
-        grad_py /= _degree    # Pa/m  y-direction
-        
-        f_depth   = depth.squeeze()
-        f_grad_px = torch.tensor(grad_px, dtype=torch.float32)   # ∂P/∂x  [Pa/m]
-        f_grad_py = torch.tensor(grad_py, dtype=torch.float32)   # ∂P/∂y  [Pa/m]
-        # u_field / v_field from holland_wind_model are already τ_x / τ_y [Pa]
-        f_tau_x   = torch.tensor(u_field, dtype=torch.float32)
-        f_tau_y   = torch.tensor(v_field, dtype=torch.float32)
-        f_n       = mannings_n.squeeze()
-        
-        # 6 Features: Depth, dP/dx, dP/dy, τ_x, τ_y, Manning's N
-        feat_t = torch.stack([f_depth, f_grad_px, f_grad_py, f_tau_x, f_tau_y, f_n], dim=1)
-        forcing_sequence.append(feat_t)
-        
-    forcing_sequence = torch.stack(forcing_sequence, dim=0) # [time_steps, num_nodes, 4]
+        p_field, tx, ty = holland_wind_model(
+            lons, lats, interp_lons[t], interp_lats[t],
+            interp_vmax[t], interp_pc[t])
+        p_pa_list.append(p_field * 100.0)   # mb → Pa
+        tau_x_list.append(tx)
+        tau_y_list.append(ty)
+
+    p_pa_all  = np.stack(p_pa_list,  axis=0).astype(np.float32)   # [T, N]
+    tau_x_all = np.stack(tau_x_list, axis=0).astype(np.float32)   # [T, N]
+    tau_y_all = np.stack(tau_y_list, axis=0).astype(np.float32)   # [T, N]
+
+    # Pressure gradient: [T, E] edge differences → [N, T] via sparse matmul → [T, N]
+    dp_edge_all = p_pa_all[:, dst_np] - p_pa_all[:, src_np]        # [T, E]
+    grad_px_all = (_A_x @ dp_edge_all.T).T / _degree               # [T, N]
+    grad_py_all = (_A_y @ dp_edge_all.T).T / _degree               # [T, N]
+
+    # Assemble 6-feature forcing tensor [T, N, 6]
+    depth_np   = nodes[:, 2].astype(np.float32)           # [N] positive-down depth
+    manning_np = mannings_n.squeeze().numpy()             # [N]
+    f_all = np.stack([
+        np.broadcast_to(depth_np,   (time_steps, _N)),   # col 0: depth
+        grad_px_all,                                      # col 1: dP/dx [Pa/m]
+        grad_py_all,                                      # col 2: dP/dy [Pa/m]
+        tau_x_all,                                        # col 3: tau_x [Pa]
+        tau_y_all,                                        # col 4: tau_y [Pa]
+        np.broadcast_to(manning_np, (time_steps, _N)),   # col 5: Manning n
+    ], axis=2)                                            # [T, N, 6]
+    forcing_sequence = torch.tensor(f_all, dtype=torch.float32)
     
     # Generate Legal Boundary Forcing from fort.15 explicitly on the 15-minute timeline
     boundary_tides = generate_boundary_tides(f14.replace('fort.14', 'fort.15'), t_seconds_5min, open_boundary_nodes)

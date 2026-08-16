@@ -42,7 +42,9 @@ def compute_swe_physics_loss(zeta_chunk, u_chunk, v_chunk, forcing_chunk,
     # Convert geographic degrees → approximate metres for gradient scaling
     # Bay of Bengal domain centred around ~21 °N
     # ------------------------------------------------------------------
-    cos_lat = torch.cos(torch.tensor(21.0 * 3.14159265 / 180.0, device=device))
+    # BUG 2 FIX: Compute cos_lat from actual mesh nodes, not hardcoded 21°N.
+    mean_lat_rad = (nodes_xy[:, 1].mean() * 3.14159265 / 180.0)
+    cos_lat = torch.cos(mean_lat_rad)
     lon_m = 111320.0 * cos_lat   # m per degree longitude
     lat_m = torch.tensor(110540.0, device=device)
 
