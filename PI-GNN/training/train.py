@@ -11,7 +11,7 @@ from training.physics_loss import compute_swe_physics_loss
 
 
 def train_model():
-    print("=== Parametric PI-GNN Surrogate Training (Hydrodynamically Honest) ===")
+    print("=== Parametric PI-GNN Surrogate Training (Non-Autoregressive) ===")
 
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../model_io'))
     f14 = os.path.join(base_dir, 'fort.14')
@@ -24,10 +24,9 @@ def train_model():
             return
 
     # -----------------------------------------------------------------------
-    # Multi-stage curriculum (mirrors the FlowFM project that solved this):
-    #   Epochs 1-7  : pure data-driven pre-training (physics_weight = 0)
-    #   Epochs 8-17 : gradual ramp  0.5 → 4.0
-    #   Epochs 18+  : full physics constraints (physics_weight = 4.0)
+    # Non-autoregressive curriculum (mirrors FlowFM project that solved drift)
+    # Each time step is predicted INDEPENDENTLY from lagged forcing history.
+    # No hidden state is passed forward → zero autoregressive drift possible.
     # -----------------------------------------------------------------------
     epochs        = 30
     learning_rate = 5e-4
@@ -37,17 +36,17 @@ def train_model():
      open_boundary_nodes, boundary_tides, nodes_xy, wet_mask) = create_full_simulation_dataset(
         f14, f22, f63)
 
-    num_nodes  = forcing_sequence.size(1)
-    time_steps = forcing_sequence.size(0)
+    num_nodes    = forcing_sequence.size(1)
+    time_steps   = forcing_sequence.size(0)
     num_features = forcing_sequence.size(2)
 
     # 80 / 20 train-test split on time axis
-    split_idx  = int(time_steps * 0.8)
+    split_idx = int(time_steps * 0.8)
     print(f"   Train: {split_idx} steps ({split_idx * 15 / 60:.1f} h) | "
           f"Test: {time_steps - split_idx} steps ({(time_steps - split_idx) * 15 / 60:.1f} h)")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"2. Initializing PI-GNN on {device}...")
+    print(f"2. Initializing Non-Autoregressive PI-GNN on {device}...")
 
     model = ParametricPIGNN(
         num_nodes=num_nodes, num_forcing_features=num_features).to(device)
@@ -57,42 +56,36 @@ def train_model():
     edge_weight      = edge_weight.to(device)
     true_zetas       = true_zetas.to(device)
     boundary_tides   = boundary_tides.to(device)
-    wet_mask         = wet_mask.to(device)          # [T, N] bool
+    wet_mask         = wet_mask.to(device)
     nodes_xy_t       = torch.tensor(nodes_xy, dtype=torch.float32, device=device)
 
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.97)
-    # criterion = torch.nn.MSELoss() (removed: using manual masked loss)
 
-    # Training indices: skip t=0 so teacher-forcing always has a valid t-1
-    # Randomize each epoch — prevents the model from learning to copy prev_state
-    # instead of learning the wind→surge relationship.
-    train_indices = np.arange(1, split_idx)
+    # Training indices: model needs N_FORCING_LAGS past steps as context
+    from model.pignn_model import N_FORCING_LAGS
+    train_indices = np.arange(N_FORCING_LAGS, split_idx)
 
-    # Window expansion: start with first 2 000 steps, grow to full dataset by epoch 17
     total_t = split_idx
-
     best_loss = float('inf')
-    print("3. Starting Curriculum Training...")
+    print("3. Starting Curriculum Training (NO teacher forcing, NO hidden state)...")
 
     for epoch in range(1, epochs + 1):
 
-        # ---- Physics weight schedule ----
-        # Start physics much earlier to prevent the model from collapsing into the trivial "predict zero" state
-        if epoch <= 3:
-            phys_weight = 0.1
-            stage = "Burn-in (w=0.1)"
+        # Physics weight schedule
+        if epoch <= 7:
+            phys_weight = 0.0
+            stage = "Data-Only Pre-training"
+        elif epoch <= 17:
+            phys_weight = 0.5 + 3.5 * (epoch - 8) / (17 - 8)
+            stage = f"Physics Ramp-Up (w={phys_weight:.2f})"
         else:
-            phys_weight = 0.1 + 3.9 * (epoch - 3) / (epochs - 3)
-            stage = f"Full Physics Ramp (w={phys_weight:.2f})"
+            phys_weight = 4.0
+            stage = "Full Physics"
 
-        # Window expansion (same schedule as FlowFM reference)
-        window = int(min(2000 + (epoch - 1) * (total_t / 17.0), total_t))
-        # chunk_size=1: 30k-node graph × 64 hidden × 4 layers already uses ~14GB.
-        # Multi-step unrolling would OOM. Drift is prevented by absolute-zeta
-        # prediction and noise injection instead.
-        chunk_size = 1
-        valid_train = train_indices[(train_indices >= 1) & (train_indices < window)]
+        # Window expansion: grow from 2000 steps to full dataset by epoch 17
+        window      = int(min(2000 + (epoch - 1) * (total_t / 17.0), total_t))
+        valid_train = train_indices[train_indices < window]
 
         steps_per_epoch = min(500, len(valid_train))
         t_sample = np.random.choice(valid_train, size=steps_per_epoch, replace=False)
@@ -107,66 +100,35 @@ def train_model():
         for step, t_idx in enumerate(t_sample):
             optimizer.zero_grad()
 
-            # ----------------------------------------------------------------
-            # 2-STEP SCHEDULED SAMPLING (Pushforward Trick)
-            # ----------------------------------------------------------------
-            # STEP 1: Start from noisy true state → predict zeta at t_idx
-            # STEP 2: Feed model's OWN step-1 output (detached) → predict t+1
-            # Loss at BOTH steps. This forces the model to experience its own
-            # prediction errors during training, closing the train/inference gap
-            # that caused monotonic drift. Memory cost = 2 × 1-step (no OOM).
-            # ----------------------------------------------------------------
-            t2 = t_idx + 1
-            if t2 >= split_idx:
-                t2 = t_idx  # Stay in bounds; only use step 1 at boundary
-
-            # --- Step 1 ---
-            true_prev_zeta = true_zetas[t_idx - 1]           # [N, 1]
-            noise = torch.randn_like(true_prev_zeta) * 0.05
-            prev_state_1 = torch.cat([
-                true_prev_zeta + noise,
-                torch.zeros_like(true_prev_zeta),
-                torch.zeros_like(true_prev_zeta),
-            ], dim=1)                                          # [N, 3]
-
-            sim_1, u_1, v_1, _ = model(
-                forcing_sequence[t_idx : t_idx + 1],
+            # NON-AUTOREGRESSIVE FORWARD PASS
+            # The model uses the FULL forcing_sequence internally to build
+            # lagged features for timestep t_idx. No prev_state needed.
+            sim_t, u_t, v_t, _ = model(
+                forcing_sequence,          # full sequence for lag lookup
                 edge_index, edge_weight, nodes_xy_t,
                 open_boundary_nodes,
                 boundary_tides[t_idx : t_idx + 1] if boundary_tides is not None else None,
-                prev_state_1,
+                t_start=int(t_idx),
             )
 
-            mask_1 = wet_mask[t_idx].unsqueeze(0).unsqueeze(-1).float()
-            n_wet_1 = mask_1.sum().clamp(min=1.0)
-            loss_1 = ((sim_1 - true_zetas[t_idx : t_idx + 1])**2 * mask_1).sum() / n_wet_1
+            # Masked MSE loss
+            mask_t = wet_mask[t_idx].unsqueeze(0).unsqueeze(-1).float()
+            n_wet  = mask_t.sum().clamp(min=1.0)
+            data_loss = ((sim_t - true_zetas[t_idx : t_idx + 1])**2 * mask_t).sum() / n_wet
 
-            # --- Step 2: feed model's OWN output (detached — no extra backprop graph) ---
-            prev_state_2 = torch.cat([
-                sim_1.detach(),                               # Model's prediction, not ground truth
-                u_1.detach(),
-                v_1.detach(),
-            ], dim=1)
-
-            sim_2, u_2, v_2, _ = model(
-                forcing_sequence[t2 : t2 + 1],
-                edge_index, edge_weight, nodes_xy_t,
-                open_boundary_nodes,
-                boundary_tides[t2 : t2 + 1] if boundary_tides is not None else None,
-                prev_state_2,
-            )
-
-            mask_2 = wet_mask[t2].unsqueeze(0).unsqueeze(-1).float()
-            n_wet_2 = mask_2.sum().clamp(min=1.0)
-            loss_2 = ((sim_2 - true_zetas[t2 : t2 + 1])**2 * mask_2).sum() / n_wet_2
-
-            data_loss = (loss_1 + loss_2) * 0.5
-
-            # Physics loss on step 1 window [t-1, t]
+            # Physics loss: use t-1 prediction (also non-autoregressive)
             if phys_weight > 0.0:
-                zeta_phys = torch.cat([(true_prev_zeta + noise).unsqueeze(0), sim_1], dim=0)
-                u_phys    = torch.cat([torch.zeros_like(true_prev_zeta).unsqueeze(0), u_1], dim=0)
-                v_phys    = torch.cat([torch.zeros_like(true_prev_zeta).unsqueeze(0), v_1], dim=0)
+                with torch.no_grad():
+                    sim_tm1, u_tm1, v_tm1, _ = model(
+                        forcing_sequence,
+                        edge_index, edge_weight, nodes_xy_t,
+                        open_boundary_nodes,
+                        boundary_tides[t_idx - 1 : t_idx] if boundary_tides is not None else None,
+                        t_start=int(t_idx - 1),
+                    )
+                zeta_phys = torch.cat([sim_tm1.detach(), sim_t], dim=0)  # [2, N, 1]
+                u_phys    = torch.cat([u_tm1.detach(),   u_t],  dim=0)
+                v_phys    = torch.cat([v_tm1.detach(),   v_t],  dim=0)
                 phys_loss = compute_swe_physics_loss(
                     zeta_phys, u_phys, v_phys,
                     forcing_sequence[t_idx - 1 : t_idx + 1], edge_index, nodes_xy_t, dt=900.0,
@@ -193,36 +155,25 @@ def train_model():
 
         avg_epoch_data = epoch_data_loss / steps_per_epoch
 
-        # ===== VALIDATION PHASE (sequential, no teacher forcing) =====
+        # ===== VALIDATION PHASE =====
+        # With non-autoregressive model, validation is simply predicting each
+        # test timestep independently — no state initialization needed.
         model.eval()
         val_loss_total = 0.0
-        val_chunks     = 0
-        
-        # FIX: Initialize validation with the TRUE state right before the split!
-        # This prevents the model from dropping into the peak of the storm with a flat zero-state ocean.
-        true_val_start = true_zetas[split_idx - 1]
-        current_state = torch.cat([
-            true_val_start,
-            torch.zeros_like(true_val_start), # U=0
-            torch.zeros_like(true_val_start)  # V=0
-        ], dim=1)
+        val_chunks = 0
 
         with torch.no_grad():
-            for start_t in range(split_idx, time_steps, 4):
-                end_t = min(start_t + 4, time_steps)
-                sim_val, _, _, current_state = model(
-                    forcing_sequence[start_t:end_t],
-                    edge_index,
-                    edge_weight,
-                    nodes_xy_t,
+            for val_t in range(split_idx, time_steps):
+                sim_val, _, _, _ = model(
+                    forcing_sequence,
+                    edge_index, edge_weight, nodes_xy_t,
                     open_boundary_nodes,
-                    boundary_tides[start_t:end_t] if boundary_tides is not None else None,
-                    current_state,
+                    boundary_tides[val_t : val_t + 1] if boundary_tides is not None else None,
+                    t_start=int(val_t),
                 )
-                # Apply same wet_mask as training so val loss is directly comparable
-                vmask_t = wet_mask[start_t:end_t].unsqueeze(-1).float()  # [chunk, N, 1]
-                n_wet_v  = vmask_t.sum().clamp(min=1.0)
-                v_loss = ((sim_val - true_zetas[start_t:end_t])**2 * vmask_t).sum() / n_wet_v
+                vmask_t = wet_mask[val_t].unsqueeze(0).unsqueeze(-1).float()
+                n_wet_v = vmask_t.sum().clamp(min=1.0)
+                v_loss  = ((sim_val - true_zetas[val_t : val_t + 1])**2 * vmask_t).sum() / n_wet_v
                 val_loss_total += v_loss.item()
                 val_chunks     += 1
 
@@ -230,7 +181,7 @@ def train_model():
         print(f"  >>> Epoch {epoch} Summary | Avg Data: {avg_epoch_data:.5f} | "
               f"Val Loss: {avg_val:.5f}")
 
-        # Save best checkpoint only from epoch 20+ (physics-constrained phase)
+        # Save best checkpoint from epoch 20+
         if epoch == 20:
             best_loss = float('inf')
         if epoch >= 20 and avg_epoch_data < best_loss:
@@ -239,7 +190,6 @@ def train_model():
                        os.path.join(os.path.dirname(__file__), 'pi_gnn_model_best.pth'))
             print(f"  *** New best model saved (epoch {epoch}) ***")
 
-    # Always save the final model for inference
     print("\nTraining Complete. Saving final simulator...")
     torch.save(model.state_dict(),
                os.path.join(os.path.dirname(__file__), 'pi_gnn_model.pth'))

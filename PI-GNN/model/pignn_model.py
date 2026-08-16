@@ -1,6 +1,19 @@
 import torch
 import torch.nn as nn
 
+# -----------------------------------------------------------------------
+# Lag Configuration (mirrors the FlowFM architecture that solved drift)
+# -----------------------------------------------------------------------
+# We pass N_LAGS past timesteps of wind/pressure forcing to every node.
+# This gives the GNN a "memory" of the storm's evolution without any
+# recurrent hidden state — which was the root cause of autoregressive drift.
+#
+# At 15-min resolution, 8 lags = 2 hours of atmospheric forcing history.
+# This covers the atmospheric spin-up time for surge development.
+N_FORCING_LAGS = 8   # number of lagged forcing snapshots (including current)
+# -----------------------------------------------------------------------
+
+
 def _mlp(in_dim, hidden_dim, out_dim, n_hidden=1):
     """Build a small MLP with SiLU activations."""
     layers = [nn.Linear(in_dim, hidden_dim), nn.SiLU()]
@@ -8,6 +21,7 @@ def _mlp(in_dim, hidden_dim, out_dim, n_hidden=1):
         layers += [nn.Linear(hidden_dim, hidden_dim), nn.SiLU()]
     layers.append(nn.Linear(hidden_dim, out_dim))
     return nn.Sequential(*layers)
+
 
 class GNNLayer(nn.Module):
     """
@@ -22,34 +36,37 @@ class GNNLayer(nn.Module):
 
     def forward(self, h, src, dst, edge_feat):
         N = h.size(0)
-        
-        # Forward direction: src -> dst
         msg_fwd = self.message_net(torch.cat([h[src], h[dst], edge_feat], dim=-1))
-        # Reverse direction: dst -> src
         msg_rev = self.message_net(torch.cat([h[dst], h[src], edge_feat], dim=-1))
-        
         agg = torch.zeros(N, msg_fwd.size(-1), device=h.device, dtype=msg_fwd.dtype)
         agg.scatter_add_(0, dst.unsqueeze(1).expand_as(msg_fwd), msg_fwd)
         agg.scatter_add_(0, src.unsqueeze(1).expand_as(msg_rev), msg_rev)
-        
-        h_new = self.update_net(torch.cat([h, agg], dim=-1))
-        return self.norm(h + h_new)
+        h_new = self.update_net(torch.cat([h.to(msg_fwd.dtype), agg], dim=-1))
+        return self.norm(h.to(msg_fwd.dtype) + h_new)
+
 
 class ParametricPIGNN(torch.nn.Module):
-    def __init__(self, num_nodes, num_forcing_features=6, hidden_dim=32, n_layers=3):
+    """
+    Non-autoregressive PI-GNN for storm surge prediction.
+
+    ARCHITECTURE (identical to FlowFM surrogate that solved drift):
+      - Input per node: [X, Y, Depth, lag_0..lag_N of (dP/dx, dP/dy, tau_x, tau_y)]
+      - Output per node: [zeta, u, v] at current timestep (ABSOLUTE, not delta)
+      - No hidden state passed forward → zero autoregressive drift
+
+    The GNN propagates tidal/surge information spatially along mesh edges
+    via message passing, learning the spatial phase response of the surge.
+    """
+    def __init__(self, num_nodes, num_forcing_features=6, hidden_dim=32, n_layers=3,
+                 n_lags=N_FORCING_LAGS):
         super(ParametricPIGNN, self).__init__()
+        self.n_lags = n_lags
 
-        # node_in = XY(2) + physics(num_forcing_features) + prev_state(3)
-        node_in_channels = 2 + num_forcing_features + 3
+        # Node input: XY(2) + depth(1) + lagged_forcing(n_lags * 4) + mannings(1)
+        # Lagged features: [dP/dx, dP/dy, tau_x, tau_y] × n_lags
+        n_lagged_feat = n_lags * 4   # 8 lags × 4 wind/pressure features = 32
+        node_in_channels = 2 + 1 + n_lagged_feat + 1  # XY + depth + lags + mannings = 36
 
-        # FIXED: Removed LayerNorm on input features.
-        # LayerNorm normalizes across feature dimensions per-node. At inference time
-        # with a single continuous sequence, the running stats are completely different
-        # from the random 4-step training windows, causing catastrophic feature shift.
-        # Instead we use a learnable per-feature scale+bias (equivalent to an affine
-        # layer with no normalization dependency on batch statistics).
-        self.feature_scale = nn.Parameter(torch.ones(node_in_channels))
-        self.feature_bias  = nn.Parameter(torch.zeros(node_in_channels))
         self.node_encoder = _mlp(node_in_channels, hidden_dim, hidden_dim)
         self.edge_encoder = _mlp(1, 16, 16)
 
@@ -57,87 +74,81 @@ class ParametricPIGNN(torch.nn.Module):
             GNNLayer(hidden_dim, 16) for _ in range(n_layers)
         ])
 
-        # Output: DELTA state (dZeta, dU, dV) - residual over prev_state.
-        # Delta prediction is more numerically stable: the model only needs to learn
-        # small corrections (~0.01m per 15min step) rather than absolute values.
-        # Drift is prevented by the 2-step scheduled sampling in the training loop.
+        # Output: ABSOLUTE (zeta, u, v) — no delta, no drift
         self.decoder = _mlp(hidden_dim, hidden_dim, 3)
 
-    def forward(self, forcing_sequence, edge_index, edge_weight, nodes_xy, open_boundary_nodes=None, boundary_tides=None, initial_states=None):
-        time_steps = forcing_sequence.size(0)
-        num_nodes = forcing_sequence.size(1)
+    def forward(self, forcing_sequence, edge_index, edge_weight, nodes_xy,
+                open_boundary_nodes=None, boundary_tides=None, initial_states=None,
+                t_start=0):
+        """
+        Args:
+            forcing_sequence: [T, N, 6] — slice of the full forcing tensor
+            edge_index, edge_weight, nodes_xy: graph topology
+            open_boundary_nodes: Dirichlet BC node list
+            boundary_tides:   [T, n_obn] water level at open boundary nodes
+            initial_states:   ignored (kept for API compatibility)
+            t_start:          global timestep index of forcing_sequence[0] in the
+                              FULL sequence — used for lag lookup.
+                              Callers should pass the full forcing tensor and
+                              set T to the desired window size via slicing, OR
+                              pass the full tensor with t_start for single-step calls.
+        """
+        T = forcing_sequence.size(0)
+        N = forcing_sequence.size(1)
         device = forcing_sequence.device
-        
+
         src, dst = edge_index[0], edge_index[1]
 
-        # Encode edge weights (inverse distances) with the updated 16-dim encoder
-        e_feat_raw = edge_weight.unsqueeze(1)
-        e = self.edge_encoder(e_feat_raw)
-        
-        # Normalize XY coordinates
+        # Encode edge weights once (same for all timesteps)
+        e = self.edge_encoder(edge_weight.unsqueeze(1))
+
+        # Normalize XY coordinates once
         x_norm = (nodes_xy[:, 0:1] - nodes_xy[:, 0:1].mean()) / (nodes_xy[:, 0:1].std() + 1e-6)
         y_norm = (nodes_xy[:, 1:2] - nodes_xy[:, 1:2].mean()) / (nodes_xy[:, 1:2].std() + 1e-6)
-        xy_features = torch.cat([x_norm, y_norm], dim=1).to(device)
-        
-        if initial_states is None:
-            prev_state = torch.zeros((num_nodes, 3), dtype=torch.float32, device=device)
-        else:
-            prev_state = initial_states
+        xy_feat = torch.cat([x_norm, y_norm], dim=1)  # [N, 2]
 
-        # BUG 5 FIX: open_boundary_nodes is a numpy array.
-        # GPU tensor indexing requires a LongTensor, not a numpy array.
-        # Convert once here before the time loop.
+        # Static features: depth [N,1] and mannings [N,1] (constant over time)
+        depth_feat    = forcing_sequence[0, :, 0:1]   # [N, 1]
+        mannings_feat = forcing_sequence[0, :, 5:6]   # [N, 1]
+
+        # Convert open boundary nodes to LongTensor once
         if open_boundary_nodes is not None and len(open_boundary_nodes) > 0:
             obn = torch.tensor(open_boundary_nodes, dtype=torch.long, device=device)
         else:
             obn = None
-            
-        simulated_zetas = []
-        simulated_u = []
-        simulated_v = []
-        zeta_t, u_t, v_t = None, None, None
-        
-        for t in range(time_steps):
-            forcing_t = forcing_sequence[t] # [num_nodes, 5]
-            
-            # === ADCIRC EXACT PHYSICS ===
-            depth      = forcing_t[:, 0:1]
-            mannings_n = forcing_t[:, 5:6]
 
-            # FIX: Use DYNAMIC total water depth H = depth + zeta_prev.
-            # Static depth ignores surge-induced depth change, freezing Cf at
-            # a wrong pre-storm value and breaking the depth-friction feedback.
-            zeta_prev  = prev_state[:, 0:1]
-            H_total    = torch.clamp(depth + zeta_prev, min=0.1)
-            Cf = (9.81 * mannings_n**2) / (H_total**(1.0/3.0))
+        simulated_zetas, simulated_u, simulated_v = [], [], []
 
-            # physical_forcing: [Depth, dP/dx, dP/dy, tau_x, tau_y, Cf] = 6 cols
-            physical_forcing = torch.cat([forcing_t[:, 0:5], Cf], dim=1)
-            
-            # Combine SPATIAL parameters (X, Y) with physical forcing (Depth, Pressure, Wind, Cf) and PREVIOUS STATE
-            node_feat = torch.cat([xy_features, physical_forcing, prev_state], dim=1)
-            
-            # Apply learnable per-feature affine scaling (no batch-stat dependency)
-            node_feat = node_feat * self.feature_scale + self.feature_bias
-            
+        for t in range(T):
+            # ----------------------------------------------------------------
+            # BUILD LAGGED FORCING FEATURES
+            # We look up lags from the FULL forcing_sequence using the global
+            # time index (t_start + t), clamped to 0 to avoid negative indices.
+            # Features used: [dP/dx, dP/dy, tau_x, tau_y] (cols 1,2,3,4)
+            # ----------------------------------------------------------------
+            global_t = t_start + t
+            lag_feats = []
+            for k in range(self.n_lags):
+                lag_t = max(0, global_t - k)
+                lag_feats.append(forcing_sequence[lag_t, :, 1:5])  # [N, 4]
+            lagged = torch.cat(lag_feats, dim=1)  # [N, n_lags*4]
+
+            # Full node feature vector
+            node_feat = torch.cat([xy_feat, depth_feat, lagged, mannings_feat], dim=1)
+
             # === DEEP MESSAGE PASSING ===
             h = self.node_encoder(node_feat)
             for layer in self.gnn_layers:
                 h = layer(h, src, dst, e)
-                
-            # Predict DELTA state (residual over prev_state).
-            # This is numerically stable: the model only learns small corrections
-            # per 15-min step. Drift is prevented by 2-step scheduled sampling.
-            preds = self.decoder(h)
-            zeta_t = prev_state[:, 0:1] + preds[:, 0:1]
-            u_t    = prev_state[:, 1:2] + preds[:, 1:2]
-            v_t    = prev_state[:, 2:3] + preds[:, 2:3]
 
-            # Clamp water level to physically plausible range
-            zeta_t = torch.clamp(zeta_t, min=-10.0, max=15.0)
+            # Predict ABSOLUTE state (no recurrence, no drift possible)
+            preds  = self.decoder(h)
+            zeta_t = torch.clamp(preds[:, 0:1], min=-10.0, max=15.0)
+            u_t    = preds[:, 1:2]
+            v_t    = preds[:, 2:3]
 
-            # === DYNAMIC WETTING & DRYING (WD) ALGORITHM ===
-            H_check = depth + zeta_t
+            # === DYNAMIC WETTING & DRYING ===
+            H_check = depth_feat + zeta_t
             wd_mask = (H_check > 0.05).float()
             u_t = u_t * wd_mask
             v_t = v_t * wd_mask
@@ -146,13 +157,13 @@ class ParametricPIGNN(torch.nn.Module):
             if obn is not None and boundary_tides is not None:
                 zeta_t = zeta_t.clone()
                 zeta_t[obn, 0] = boundary_tides[t]
-                
-            prev_state = torch.cat([zeta_t, u_t, v_t], dim=1)
+
             simulated_zetas.append(zeta_t)
             simulated_u.append(u_t)
             simulated_v.append(v_t)
-            
-        return (torch.stack(simulated_zetas, dim=0), 
-                torch.stack(simulated_u, dim=0), 
-                torch.stack(simulated_v, dim=0), 
-                prev_state)
+
+        dummy_state = torch.zeros((N, 3), device=device)
+        return (torch.stack(simulated_zetas, dim=0),
+                torch.stack(simulated_u, dim=0),
+                torch.stack(simulated_v, dim=0),
+                dummy_state)
