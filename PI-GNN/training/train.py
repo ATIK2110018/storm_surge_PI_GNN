@@ -78,15 +78,13 @@ def train_model():
     for epoch in range(1, epochs + 1):
 
         # ---- Physics weight schedule ----
-        if epoch <= 7:
-            phys_weight = 0.0
-            stage = "Data-Only Pre-training"
-        elif epoch <= 17:
-            phys_weight = 0.5 + 3.5 * (epoch - 8) / (17 - 8)
-            stage = f"Physics Ramp-Up (w={phys_weight:.2f})"
+        # Start physics much earlier to prevent the model from collapsing into the trivial "predict zero" state
+        if epoch <= 3:
+            phys_weight = 0.1
+            stage = "Burn-in (w=0.1)"
         else:
-            phys_weight = 4.0
-            stage = "Full Physics"
+            phys_weight = 0.1 + 3.9 * (epoch - 3) / (epochs - 3)
+            stage = f"Full Physics Ramp (w={phys_weight:.2f})"
 
         # Window expansion (same schedule as FlowFM reference)
         window = int(min(2000 + (epoch - 1) * (total_t / 17.0), total_t))
@@ -107,14 +105,19 @@ def train_model():
             optimizer.zero_grad()
 
             # -----------------------------------------------------------------
-            # Teacher forcing: provide the TRUE previous state (zeta_t-1, 0, 0)
-            # as initial_states. We don't have true U/V from fort.63, so we
-            # initialise velocity to zero — physically correct (start fresh each
-            # random window, no sequential-copy shortcut).
+            # PUSHFORWARD TRICK (Noise Injection)
             # -----------------------------------------------------------------
+            # If we give the network the PERFECT previous state, it learns to just 
+            # output 0.0 (identity function) because the true water level changes 
+            # very little in 15 mins. By adding 5cm of Gaussian noise, we FORCE the 
+            # GNN to use its spatial message passing to smooth out the noise and 
+            # predict a non-zero residual to recover the true clean water level.
             true_prev_zeta = true_zetas[t_idx - 1]       # [N, 1]
+            noise = torch.randn_like(true_prev_zeta) * 0.05
+            noisy_prev_zeta = true_prev_zeta + noise
+            
             prev_state = torch.cat([
-                true_prev_zeta,
+                noisy_prev_zeta,
                 torch.zeros_like(true_prev_zeta),          # U₀ = 0
                 torch.zeros_like(true_prev_zeta),          # V₀ = 0
             ], dim=1)                                      # [N, 3]
