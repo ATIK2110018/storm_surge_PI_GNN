@@ -41,9 +41,10 @@ def train_model():
     time_steps   = forcing_sequence.size(0)
     num_features = forcing_sequence.size(2)
 
-    # Train on FULL dataset (no split)
-    split_idx = time_steps
-    print(f"   Train: {split_idx} steps ({split_idx * 15 / 60:.1f} h) | Test: 0 steps")
+    # 80 / 20 train-test split on time axis
+    split_idx = int(time_steps * 0.8)
+    print(f"   Train: {split_idx} steps ({split_idx * 15 / 60:.1f} h) | "
+          f"Test: {time_steps - split_idx} steps ({(time_steps - split_idx) * 15 / 60:.1f} h)")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"2. Initializing Non-Autoregressive PI-GNN on {device}...")
@@ -176,7 +177,7 @@ def train_model():
         val_chunks = 0
 
         with torch.no_grad():
-            for val_t in range(time_steps):
+            for val_t in range(split_idx, time_steps):
                 sim_val, _, _, _ = model(
                     forcing_sequence,
                     edge_index, edge_weight, nodes_xy_t,
