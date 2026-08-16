@@ -6,6 +6,7 @@ from torch.optim import Adam
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from model.pignn_model import ParametricPIGNN
 from dataset.data_extractor import create_full_simulation_dataset
+from training.physics_loss import compute_physics_loss
 
 def train_model():
     print("=== Parametric PI-GNN Surrogate Training ===")
@@ -76,7 +77,27 @@ def train_model():
                 boundary_tides[start_t:end_t] if boundary_tides is not None else None
             )
             
-            loss = criterion(sim_chunk, true_zetas[start_t:end_t])
+            data_loss = criterion(sim_chunk, true_zetas[start_t:end_t])
+            
+            # === FLOWFM MULTI-STAGE PHYSICS SCHEDULE ===
+            # Epochs 0-20: Data-only (burn-in period for stability)
+            # Epochs 20-50: Ramp up physics weight from 0 to 4.0
+            # Epochs 50+: Full physics optimization (weight 4.0)
+            if epoch < 20:
+                physics_weight = 0.0
+            elif epoch < 50:
+                physics_weight = 4.0 * ((epoch - 20) / 30.0)
+            else:
+                physics_weight = 4.0
+                
+            # Physics Loss: Enforces SWE continuity (mass conservation) and spatial smoothness
+            if physics_weight > 0:
+                phys_loss = compute_physics_loss(sim_chunk, None, None, None, edge_index)
+                loss = data_loss + physics_weight * phys_loss
+            else:
+                phys_loss = torch.tensor(0.0)
+                loss = data_loss
+                
             loss.backward()
             
             # Gradient Clipping
