@@ -186,8 +186,13 @@ def holland_wind_model(lons, lats, storm_lon, storm_lat, vmax_knots, pc_mb, pn_m
 
     return pressure_field, tau_x, tau_y
 
-def create_full_simulation_dataset(f14, f22, f63):
-    """Returns a single massive forcing tensor covering all timesteps."""
+def create_full_simulation_dataset(f14, f22, f63, f64=None):
+    """Returns a single massive forcing tensor covering all timesteps.
+    
+    f64 (optional): path to fort.64.nc (depth-averaged velocities).
+           If provided, true_uvels [T,N,1] and true_vvels [T,N,1] are
+           also returned for velocity supervision during training.
+    """
     nodes, elements, open_boundary_nodes = load_adcirc_mesh(f14)
     edge_index = create_graph_edges(elements)
     
@@ -256,6 +261,43 @@ def create_full_simulation_dataset(f14, f22, f63):
     zeta_5min[~wet_mask_np] = 0.0                   # ensure dry nodes stay 0
     true_zetas = torch.tensor(zeta_5min,  dtype=torch.float32).unsqueeze(2)  # [T,N,1]
     wet_mask   = torch.tensor(wet_mask_np, dtype=torch.bool)                  # [T,N]
+
+    # ---- Load velocity ground truth from fort.64.nc (optional) ----
+    # ADCIRC fort.64.nc: variables 'u-vel' and 'v-vel' [T, N]
+    true_uvels = None
+    true_vvels = None
+    if f64 is None:
+        # Auto-detect next to fort.63.nc
+        _candidate = f63.replace('fort.63.nc', 'fort.64.nc')
+        if os.path.exists(_candidate):
+            f64 = _candidate
+    if f64 is not None and os.path.exists(f64):
+        print("Loading fort.64.nc (depth-averaged velocities)...")
+        ds64 = nc.Dataset(f64)
+        # Variable names differ by ADCIRC version — try common names
+        u_key = next((k for k in ['u-vel','u_vel','u','eastward_sea_water_velocity'] if k in ds64.variables), None)
+        v_key = next((k for k in ['v-vel','v_vel','v','northward_sea_water_velocity'] if k in ds64.variables), None)
+        if u_key and v_key:
+            orig_u_ma = ds64.variables[u_key][:]   # MaskedArray [T_orig, N]
+            orig_v_ma = ds64.variables[v_key][:]   # MaskedArray [T_orig, N]
+            orig_u_filled = np.ma.filled(orig_u_ma, 0.0).astype(np.float32)
+            orig_v_filled = np.ma.filled(orig_v_ma, 0.0).astype(np.float32)
+            # fort.64 may have different time axis — use fort.63 time
+            u_t64 = np.array(ds64.variables['time'][:])
+            ds64.close()
+            # Interpolate to 15-min grid
+            u_5min = interp1d(u_t64, orig_u_filled, axis=0,
+                              fill_value='extrapolate')(t_seconds_5min)
+            v_5min = interp1d(u_t64, orig_v_filled, axis=0,
+                              fill_value='extrapolate')(t_seconds_5min)
+            u_5min[~wet_mask_np] = 0.0
+            v_5min[~wet_mask_np] = 0.0
+            true_uvels = torch.tensor(u_5min, dtype=torch.float32).unsqueeze(2)  # [T,N,1]
+            true_vvels = torch.tensor(v_5min, dtype=torch.float32).unsqueeze(2)  # [T,N,1]
+            print(f"   Loaded velocity data: U range [{u_5min.min():.3f}, {u_5min.max():.3f}] m/s")
+        else:
+            print(f"   WARNING: fort.64.nc found but velocity variables not identified. Keys: {list(ds64.variables.keys())}")
+            ds64.close()
     
     track_data = parse_fort22(f22)
     
@@ -359,4 +401,5 @@ def create_full_simulation_dataset(f14, f22, f63):
     edge_weight = torch.tensor(1.0 / dists, dtype=torch.float32)
 
     return (forcing_sequence, edge_index, edge_weight, true_zetas,
-            open_boundary_nodes, boundary_tides, nodes, wet_mask)
+            open_boundary_nodes, boundary_tides, nodes, wet_mask,
+            true_uvels, true_vvels)   # None if fort.64.nc not found

@@ -33,7 +33,8 @@ def train_model():
 
     print("1. Compiling Full Storm Dataset (Track + Mesh + Boundaries)...")
     (forcing_sequence, edge_index, edge_weight, true_zetas,
-     open_boundary_nodes, boundary_tides, nodes_xy, wet_mask) = create_full_simulation_dataset(
+     open_boundary_nodes, boundary_tides, nodes_xy, wet_mask,
+     true_uvels, true_vvels) = create_full_simulation_dataset(
         f14, f22, f63)
 
     num_nodes    = forcing_sequence.size(1)
@@ -58,6 +59,10 @@ def train_model():
     boundary_tides   = boundary_tides.to(device)
     wet_mask         = wet_mask.to(device)
     nodes_xy_t       = torch.tensor(nodes_xy, dtype=torch.float32, device=device)
+    
+    if true_uvels is not None:
+        true_uvels = true_uvels.to(device)
+        true_vvels = true_vvels.to(device)
 
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.97)
@@ -114,7 +119,16 @@ def train_model():
             # Masked MSE loss
             mask_t = wet_mask[t_idx].unsqueeze(0).unsqueeze(-1).float()
             n_wet  = mask_t.sum().clamp(min=1.0)
-            data_loss = ((sim_t - true_zetas[t_idx : t_idx + 1])**2 * mask_t).sum() / n_wet
+            data_loss_zeta = ((sim_t - true_zetas[t_idx : t_idx + 1])**2 * mask_t).sum() / n_wet
+            
+            data_loss_uv = 0.0
+            if true_uvels is not None:
+                data_loss_u = ((u_t - true_uvels[t_idx : t_idx + 1])**2 * mask_t).sum() / n_wet
+                data_loss_v = ((v_t - true_vvels[t_idx : t_idx + 1])**2 * mask_t).sum() / n_wet
+                data_loss_uv = data_loss_u + data_loss_v
+            
+            # Velocity values are typically smaller than surge elevations; weight them equally for now
+            data_loss = data_loss_zeta + 1.0 * data_loss_uv
 
             # Physics loss: use t-1 prediction (also non-autoregressive)
             if phys_weight > 0.0:
