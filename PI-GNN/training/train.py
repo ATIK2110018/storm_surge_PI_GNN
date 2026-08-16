@@ -77,19 +77,12 @@ def train_model():
 
     for epoch in range(1, epochs + 1):
 
-        # Physics weight schedule
-        if epoch <= 7:
-            phys_weight = 0.0
-            stage = "Data-Only Pre-training"
-        elif epoch <= 17:
-            phys_weight = 0.5 + 3.5 * (epoch - 8) / (17 - 8)
-            stage = f"Physics Ramp-Up (w={phys_weight:.2f})"
-        else:
-            phys_weight = 4.0
-            stage = "Full Physics"
+        # Physics weight schedule (DATA-ONLY EXPERIMENT)
+        phys_weight = 0.0
+        stage = "Data-Only Experiment"
 
-        # Window expansion: grow from 2000 steps to full dataset by epoch 17
-        window      = int(min(2000 + (epoch - 1) * (total_t / 17.0), total_t))
+        # Window expansion: grow from 2000 steps to full dataset by epoch 10
+        window      = int(min(2000 + (epoch - 1) * (total_t / 10.0), total_t))
         valid_train = train_indices[train_indices < window]
 
         steps_per_epoch = min(500, len(valid_train))
