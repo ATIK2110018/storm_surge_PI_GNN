@@ -137,13 +137,24 @@ class ParametricPIGNN(torch.nn.Module):
             for k in range(self.n_lags):
                 lag_t = max(0, global_t - k)
                 # cols 1:6 = [dP/dx, dP/dy, tau_x, tau_y, mean_bt]
-                # mean_bt (col 6) is CRITICAL: it tells the model the tidal phase!
-                lag_feats.append(forcing_sequence[lag_t, :, 1:6])  # [N, 5]
-            lagged = torch.cat(lag_feats, dim=1)  # [N, n_lags*4]
+                # mean_bt (col 4 after slicing) is CRITICAL: it tells the model the tidal phase!
+                raw_lag = forcing_sequence[lag_t, :, 1:6].clone()
+                
+                # Apply fixed physical scaling to normalize features for the MLP
+                raw_lag[:, 0] *= 100.0   # dP/dx (typically very small, ~0.01)
+                raw_lag[:, 1] *= 100.0   # dP/dy
+                raw_lag[:, 2] *= 0.2     # tau_x (typically up to ~5)
+                raw_lag[:, 3] *= 0.2     # tau_y
+                # raw_lag[:, 4] is mean_bt, typically -2 to 2, no scaling needed
+                
+                lag_feats.append(raw_lag)  # [N, 5]
+            lagged = torch.cat(lag_feats, dim=1)  # [N, n_lags*5]
 
             # Depth and mannings from current global timestep
-            depth_t    = forcing_sequence[global_t, :, 0:1]
-            mannings_t = forcing_sequence[global_t, :, 5:6]
+            raw_depth_t = forcing_sequence[global_t, :, 0:1]
+            depth_t     = raw_depth_t / 1000.0  # Scale depth (0-3000m) to roughly 0-3
+            
+            mannings_t  = forcing_sequence[global_t, :, 5:6] * 10.0 # Scale mannings (0.02 - 0.1) to roughly 0.2 - 1.0
 
             # Full node feature vector
             node_feat = torch.cat([xy_feat, depth_t, lagged, mannings_t], dim=1)
@@ -160,7 +171,7 @@ class ParametricPIGNN(torch.nn.Module):
             v_t    = preds[:, 2:3]
 
             # === DYNAMIC WETTING & DRYING ===
-            H_check = depth_t + zeta_t
+            H_check = raw_depth_t + zeta_t
             wd_mask = (H_check > 0.05).float()
             u_t = u_t * wd_mask
             v_t = v_t * wd_mask
