@@ -62,10 +62,12 @@ class ParametricPIGNN(torch.nn.Module):
         super(ParametricPIGNN, self).__init__()
         self.n_lags = n_lags
 
-        # Node input: XY(2) + depth(1) + lagged_forcing(n_lags * 4) + mannings(1)
-        # Lagged features: [dP/dx, dP/dy, tau_x, tau_y] × n_lags
-        n_lagged_feat = n_lags * 4   # 8 lags × 4 wind/pressure features = 32
-        node_in_channels = 2 + 1 + n_lagged_feat + 1  # XY + depth + lags + mannings = 36
+        # Node input: XY(2) + depth(1) + lagged_forcing(n_lags * 5) + mannings(1)
+        # Lagged features: [dP/dx, dP/dy, tau_x, tau_y, mean_bt] × n_lags
+        # mean_bt (col 6) is the mean open-boundary tidal elevation — the KEY
+        # signal that tells the model the tidal phase at each timestep.
+        n_lagged_feat = n_lags * 5   # 8 lags × 5 features = 40
+        node_in_channels = 2 + 1 + n_lagged_feat + 1  # XY + depth + lags + mannings = 44
 
         self.node_encoder = _mlp(node_in_channels, hidden_dim, hidden_dim)
         self.edge_encoder = _mlp(1, 16, 16)
@@ -134,7 +136,9 @@ class ParametricPIGNN(torch.nn.Module):
             lag_feats = []
             for k in range(self.n_lags):
                 lag_t = max(0, global_t - k)
-                lag_feats.append(forcing_sequence[lag_t, :, 1:5])  # [N, 4]
+                # cols 1:6 = [dP/dx, dP/dy, tau_x, tau_y, mean_bt]
+                # mean_bt (col 6) is CRITICAL: it tells the model the tidal phase!
+                lag_feats.append(forcing_sequence[lag_t, :, 1:6])  # [N, 5]
             lagged = torch.cat(lag_feats, dim=1)  # [N, n_lags*4]
 
             # Depth and mannings from current global timestep

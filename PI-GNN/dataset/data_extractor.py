@@ -314,10 +314,9 @@ def create_full_simulation_dataset(f14, f22, f63):
     grad_px_all = (_A_x @ dp_edge_all.T).T / _degree               # [T, N]
     grad_py_all = (_A_y @ dp_edge_all.T).T / _degree               # [T, N]
 
-    # Assemble 6-feature forcing tensor [T, N, 6]
+    # Assemble 6-feature forcing tensor [T, N, 6], then append tidal signal
     depth_np   = nodes[:, 2].astype(np.float32)           # [N] positive-down depth
-    manning_np = mannings_n.squeeze().numpy()             # [N]
-    
+    manning_np = mannings_n.squeeze().numpy()             # [N]\n
     # BUG 6 FIX: Use np.tile instead of broadcast_to to prevent memory doubling in np.stack
     f_all = np.stack([
         np.tile(depth_np, (time_steps, 1)),               # col 0: depth
@@ -327,6 +326,24 @@ def create_full_simulation_dataset(f14, f22, f63):
         tau_y_all,                                        # col 4: tau_y [Pa]
         np.tile(manning_np, (time_steps, 1)),             # col 5: Manning n
     ], axis=2)                                            # [T, N, 6]
+
+    # -----------------------------------------------------------------
+    # TIDAL PHASE FEATURE (col 6)
+    # The non-autoregressive model needs the tidal cycle as an input.
+    # Compute the mean open-boundary tide at each timestep and broadcast
+    # it to ALL nodes. This gives the GNN the tidal phase/amplitude so
+    # it can learn to propagate the tidal signal from the boundary inland.
+    # Without this, the model has no information about the tidal cycle!
+    # -----------------------------------------------------------------
+    print("Computing boundary tides for tidal phase feature (col 6)...")
+    bt_signal = generate_boundary_tides(
+        f14.replace('fort.14', 'fort.15'), t_seconds_5min, open_boundary_nodes)
+    # bt_signal: [T, n_obn] → mean per timestep → [T]
+    mean_bt = bt_signal.mean(axis=1, keepdims=True)       # [T, 1]
+    mean_bt_col = np.tile(mean_bt, (1, f_all.shape[1]))   # [T, N]
+    f_all = np.concatenate(
+        [f_all, mean_bt_col[:, :, np.newaxis]], axis=2)   # [T, N, 7]
+
     forcing_sequence = torch.tensor(f_all, dtype=torch.float32)
     
     # Generate Legal Boundary Forcing from fort.15 explicitly on the 15-minute timeline
