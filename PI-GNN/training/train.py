@@ -4,11 +4,11 @@ import torch
 from torch.optim import Adam
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from model.st_gnn import AutoregressiveSurrogate
-from dataset.process_adcirc import create_full_simulation_dataset
+from model.pignn_model import ParametricPIGNN
+from dataset.data_extractor import create_full_simulation_dataset
 
 def train_model():
-    print("=== PI-GNN Autoregressive Simulator Training ===")
+    print("=== Parametric PI-GNN Surrogate Training ===")
     
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../model_io'))
     f14 = os.path.join(base_dir, 'fort.14')
@@ -24,16 +24,20 @@ def train_model():
     learning_rate = 0.0005 # Dropped 10x to ensure smooth, linear convergence
     
     print("1. Compiling Full Storm Dataset (Track + Mesh + Boundaries)...")
-    forcing_sequence, edge_index, edge_weight, true_zetas, open_boundary_nodes, boundary_tides = create_full_simulation_dataset(f14, f22, f63)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"2. Initializing Autoregressive Simulator on {device}...")
+    forcing_sequence, edge_index, edge_weight, true_zetas, open_boundary_nodes, boundary_tides, nodes_xy = create_full_simulation_dataset(f14, f22, f63)
     
     num_nodes = forcing_sequence.size(1)
     time_steps = forcing_sequence.size(0)
+    
+    split_idx = int(time_steps * 0.8)
+    print(f"Train/Test Split: {split_idx} train steps ({split_idx * 15 / 60:.1f} hours) | {time_steps - split_idx} test steps ({(time_steps - split_idx) * 15 / 60:.1f} hours)")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"2. Initializing Parametric PI-GNN on {device}...")
+    
     num_features = forcing_sequence.size(2) # 4 forcing features
     
-    model = AutoregressiveSurrogate(num_nodes=num_nodes, num_forcing_features=num_features).to(device)
+    model = ParametricPIGNN(num_nodes=num_nodes, num_forcing_features=num_features).to(device)
     
     # Move huge tensors to device
     forcing_sequence = forcing_sequence.to(device)
@@ -41,6 +45,7 @@ def train_model():
     edge_weight = edge_weight.to(device)
     true_zetas = true_zetas.to(device)
     boundary_tides = boundary_tides.to(device)
+    nodes_xy = torch.tensor(nodes_xy, dtype=torch.float32).to(device)
     
     optimizer = Adam(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
@@ -49,50 +54,64 @@ def train_model():
     print("3. Starting True Simulation Loop...")
     for epoch in range(epochs):
         
-        zeta_t = torch.zeros((num_nodes, 1), dtype=torch.float32, device=device)
-        u_t = torch.zeros((num_nodes, 1), dtype=torch.float32, device=device)
-        v_t = torch.zeros((num_nodes, 1), dtype=torch.float32, device=device)
-        
-        total_loss = 0
-        # Dropped chunk_size back to 24 because the new Deep 128-dimensional GNN 
-        # is massive and requires more VRAM per step than the old 16-dim network.
+        # === TRAINING PHASE ===
+        model.train()
+        total_train_loss = 0
         chunk_size = 24
-        num_chunks = 0
+        num_train_chunks = 0
         
-        for start_t in range(0, time_steps, chunk_size):
+        for start_t in range(0, split_idx, chunk_size):
             optimizer.zero_grad()
-            end_t = min(start_t + chunk_size, time_steps)
+            end_t = min(start_t + chunk_size, split_idx)
             
-            # Standard float32 precision for Explicit Euler numerical stability!
-            sim_chunk, zeta_t, u_t, v_t = model(
+            sim_chunk, _, _, _ = model(
                 forcing_sequence[start_t:end_t], 
                 edge_index, 
                 edge_weight,
+                nodes_xy,
                 open_boundary_nodes, 
-                boundary_tides[start_t:end_t] if boundary_tides is not None else None,
-                initial_states=(zeta_t, u_t, v_t)
+                boundary_tides[start_t:end_t] if boundary_tides is not None else None
             )
             
             loss = criterion(sim_chunk, true_zetas[start_t:end_t])
             loss.backward()
             
-            # Gradient Clipping: Prevents abrupt spikes in the loss curve!
+            # Gradient Clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
-            # True TBPTT detachment
-            zeta_t = zeta_t.detach()
-            u_t = u_t.detach()
-            v_t = v_t.detach()
+            total_train_loss += loss.item()
+            num_train_chunks += 1
             
-            total_loss += loss.item()
-            num_chunks += 1
-            
-        avg_loss = total_loss / num_chunks
+        avg_train_loss = total_train_loss / num_train_chunks
         scheduler.step()
         
+        # === VALIDATION PHASE (UNSEEN DATA) ===
+        model.eval()
+        total_val_loss = 0
+        num_val_chunks = 0
+        
+        with torch.no_grad():
+            for start_t in range(split_idx, time_steps, chunk_size):
+                end_t = min(start_t + chunk_size, time_steps)
+                
+                sim_chunk, _, _, _ = model(
+                    forcing_sequence[start_t:end_t], 
+                    edge_index, 
+                    edge_weight,
+                    nodes_xy,
+                    open_boundary_nodes, 
+                    boundary_tides[start_t:end_t] if boundary_tides is not None else None
+                )
+                
+                val_loss = criterion(sim_chunk, true_zetas[start_t:end_t])
+                total_val_loss += val_loss.item()
+                num_val_chunks += 1
+                
+        avg_val_loss = total_val_loss / (num_val_chunks + 1e-8)
+        
         if epoch % 10 == 0:
-            print(f"Epoch {epoch}/{epochs} | Avg TBPTT Loss (MSE): {avg_loss:.6f} | LR: {scheduler.get_last_lr()[0]:.6e}")
+            print(f"Epoch {epoch}/{epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | LR: {scheduler.get_last_lr()[0]:.6e}")
         
     print("Training Complete. Saving simulator...")
     torch.save(model.state_dict(), os.path.join(os.path.dirname(__file__), 'pi_gnn_model.pth'))

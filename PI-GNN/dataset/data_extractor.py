@@ -274,4 +274,4 @@ def create_full_simulation_dataset(f14, f22, f63):
     dists = np.clip(dists, 1.0, None) # Prevent divide by zero
     edge_weight = torch.tensor(1.0 / dists, dtype=torch.float32) # Inverse distance weighting
     
-    return forcing_sequence, edge_index, edge_weight, true_zetas, open_boundary_nodes, boundary_tides
+    return forcing_sequence, edge_index, edge_weight, true_zetas, open_boundary_nodes, boundary_tides, nodes
