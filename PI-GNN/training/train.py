@@ -88,8 +88,8 @@ def train_model():
             phys_weight = 4.0
             stage = "Full Physics"
 
-        # Window expansion: grow from 2000 steps to full dataset by epoch 25
-        window      = int(min(2000 + (epoch - 1) * (total_t / 25.0), total_t))
+        # Window expansion: grow from 30 steps to full dataset by epoch 25
+        window      = int(min(30 + (epoch - 1) * (total_t / 25.0), total_t))
         valid_train = train_indices[train_indices < window]
 
         steps_per_epoch = min(500, len(valid_train))
