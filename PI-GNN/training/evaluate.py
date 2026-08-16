@@ -7,8 +7,8 @@ import sys
 from sklearn.metrics import mean_squared_error, r2_score
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from model.st_gnn import AutoregressiveSurrogate
-from dataset.process_adcirc import create_full_simulation_dataset
+from model.pignn_model import ParametricPIGNN
+from dataset.data_extractor import create_full_simulation_dataset
 
 def evaluate():
     print("=== PI-GNN Engineering Evaluation ===")
@@ -20,13 +20,19 @@ def evaluate():
     f63 = os.path.join(base_dir, 'fort.63.nc')
     
     print("1. Re-loading the test data and trained model...")
-    forcing_sequence, edge_index, edge_weight, true_zetas, open_boundary_nodes, boundary_tides = create_full_simulation_dataset(f14, f22, f63)
+    (forcing_sequence, edge_index, edge_weight, true_zetas, 
+     open_boundary_nodes, boundary_tides, nodes_xy, wet_mask) = create_full_simulation_dataset(f14, f22, f63)
     
     num_nodes = forcing_sequence.size(1)
-    # Model uses 5 features (Depth, P, U, V, Manning)
-    model = AutoregressiveSurrogate(num_nodes=num_nodes, num_forcing_features=5).to(device)
+    num_features = forcing_sequence.size(2)
+    model = ParametricPIGNN(num_nodes=num_nodes, num_forcing_features=num_features).to(device)
     model_path = os.path.join(os.path.dirname(__file__), 'pi_gnn_model.pth')
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=device))
+    else:
+        print(f"Warning: {model_path} not found. Running with untrained weights!")
+        
     model.eval()
     
     print("2. Running the Full Autoregressive Simulation...")
@@ -34,9 +40,12 @@ def evaluate():
     edge_index = edge_index.to(device)
     edge_weight = edge_weight.to(device)
     boundary_tides = boundary_tides.to(device)
+    nodes_xy_t = torch.tensor(nodes_xy, dtype=torch.float32, device=device)
     
     with torch.no_grad():
-        simulated_zetas, _, _, _ = model(forcing_sequence, edge_index, edge_weight, open_boundary_nodes, boundary_tides)
+        simulated_zetas, _, _, _, _ = model(
+            forcing_sequence, edge_index, edge_weight, nodes_xy_t, open_boundary_nodes, boundary_tides
+        )
         
     preds_array = simulated_zetas.cpu().numpy().squeeze()
     truth_array = true_zetas.numpy().squeeze()
