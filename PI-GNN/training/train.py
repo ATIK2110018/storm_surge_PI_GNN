@@ -184,7 +184,15 @@ def train_model():
         model.eval()
         val_loss_total = 0.0
         val_chunks     = 0
-        current_state  = None
+        
+        # FIX: Initialize validation with the TRUE state right before the split!
+        # This prevents the model from dropping into the peak of the storm with a flat zero-state ocean.
+        true_val_start = true_zetas[split_idx - 1]
+        current_state = torch.cat([
+            true_val_start,
+            torch.zeros_like(true_val_start), # U=0
+            torch.zeros_like(true_val_start)  # V=0
+        ], dim=1)
 
         with torch.no_grad():
             for start_t in range(split_idx, time_steps, 4):
