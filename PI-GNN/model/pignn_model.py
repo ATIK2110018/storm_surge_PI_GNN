@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-def _mlp(in_dim, hidden_dim, out_dim, n_hidden=2):
+def _mlp(in_dim, hidden_dim, out_dim, n_hidden=1):
     """Build a small MLP with SiLU activations."""
     layers = [nn.Linear(in_dim, hidden_dim), nn.SiLU()]
     for _ in range(n_hidden - 1):
@@ -36,7 +36,7 @@ class GNNLayer(nn.Module):
         return self.norm(h + h_new)
 
 class ParametricPIGNN(torch.nn.Module):
-    def __init__(self, num_nodes, num_forcing_features=5, hidden_dim=128, n_layers=4):
+    def __init__(self, num_nodes, num_forcing_features=5, hidden_dim=32, n_layers=3):
         super(ParametricPIGNN, self).__init__()
         
         # Spatial inputs (X, Y) = 2
@@ -44,14 +44,14 @@ class ParametricPIGNN(torch.nn.Module):
         node_in_channels = 2 + num_forcing_features
         
         self.node_encoder = _mlp(node_in_channels, hidden_dim, hidden_dim)
-        self.edge_encoder = _mlp(1, 16, 16) # Encode scalar edge_weight (inverse dist)
+        self.edge_encoder = _mlp(1, 8, 8) # Encode scalar edge_weight (inverse dist)
         
         self.gnn_layers = nn.ModuleList([
-            GNNLayer(hidden_dim, 16) for _ in range(n_layers)
+            GNNLayer(hidden_dim, 8) for _ in range(n_layers)
         ])
         
         # Output is the ABSOLUTE state: Water Level, U_velocity, and V_velocity
-        self.decoder = _mlp(hidden_dim, hidden_dim // 2, 3)
+        self.decoder = _mlp(hidden_dim, hidden_dim, 3)
 
     def forward(self, forcing_sequence, edge_index, edge_weight, nodes_xy, open_boundary_nodes=None, boundary_tides=None, initial_states=None):
         time_steps = forcing_sequence.size(0)
