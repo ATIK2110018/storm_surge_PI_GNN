@@ -28,7 +28,7 @@ def train_model():
     # Each time step is predicted INDEPENDENTLY from lagged forcing history.
     # No hidden state is passed forward → zero autoregressive drift possible.
     # -----------------------------------------------------------------------
-    epochs        = 30
+    epochs        = 60
     learning_rate = 5e-4
 
     print("1. Compiling Full Storm Dataset (Track + Mesh + Boundaries)...")
@@ -77,12 +77,19 @@ def train_model():
 
     for epoch in range(1, epochs + 1):
 
-        # Physics weight schedule (DATA-ONLY EXPERIMENT)
-        phys_weight = 0.0
-        stage = "Data-Only Experiment"
+        # Physics weight schedule (60-Epoch Curriculum)
+        if epoch <= 30:
+            phys_weight = 0.0
+            stage = "Data-Only Pre-training"
+        elif epoch <= 40:
+            phys_weight = 0.5 + 3.5 * (epoch - 31) / (40 - 31)
+            stage = f"Physics Ramp-Up (w={phys_weight:.2f})"
+        else:
+            phys_weight = 4.0
+            stage = "Full Physics"
 
-        # Window expansion: grow from 2000 steps to full dataset by epoch 10
-        window      = int(min(2000 + (epoch - 1) * (total_t / 10.0), total_t))
+        # Window expansion: grow from 2000 steps to full dataset by epoch 25
+        window      = int(min(2000 + (epoch - 1) * (total_t / 25.0), total_t))
         valid_train = train_indices[train_indices < window]
 
         steps_per_epoch = min(500, len(valid_train))
