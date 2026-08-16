@@ -87,6 +87,8 @@ class ParametricPIGNN(torch.nn.Module):
             obn = None
             
         simulated_zetas = []
+        simulated_u = []
+        simulated_v = []
         zeta_t, u_t, v_t = None, None, None
         
         for t in range(time_steps):
@@ -139,5 +141,10 @@ class ParametricPIGNN(torch.nn.Module):
                 
             prev_state = torch.cat([zeta_t, u_t, v_t], dim=1)
             simulated_zetas.append(zeta_t)
+            simulated_u.append(u_t)
+            simulated_v.append(v_t)
             
-        return torch.stack(simulated_zetas, dim=0), zeta_t, u_t, v_t, prev_state
+        return (torch.stack(simulated_zetas, dim=0), 
+                torch.stack(simulated_u, dim=0), 
+                torch.stack(simulated_v, dim=0), 
+                prev_state)

@@ -88,9 +88,11 @@ def train_model():
 
         # Window expansion (same schedule as FlowFM reference)
         window = int(min(2000 + (epoch - 1) * (total_t / 17.0), total_t))
-        valid_train = train_indices[train_indices < window]
-
-        # Sample 1 000 random time steps per epoch
+        # Sample random START times for multi-step rollout.
+        # We need chunk_size=4, so max t_idx is split_idx - 4
+        chunk_size = 4
+        valid_train = train_indices[(train_indices >= 1) & (train_indices < window - chunk_size)]
+        
         steps_per_epoch = min(1000, len(valid_train))
         t_sample = np.random.choice(valid_train, size=steps_per_epoch, replace=False)
 
@@ -104,14 +106,6 @@ def train_model():
         for step, t_idx in enumerate(t_sample):
             optimizer.zero_grad()
 
-            # -----------------------------------------------------------------
-            # PUSHFORWARD TRICK (Noise Injection)
-            # -----------------------------------------------------------------
-            # If we give the network the PERFECT previous state, it learns to just 
-            # output 0.0 (identity function) because the true water level changes 
-            # very little in 15 mins. By adding 5cm of Gaussian noise, we FORCE the 
-            # GNN to use its spatial message passing to smooth out the noise and 
-            # predict a non-zero residual to recover the true clean water level.
             true_prev_zeta = true_zetas[t_idx - 1]       # [N, 1]
             noise = torch.randn_like(true_prev_zeta) * 0.05
             noisy_prev_zeta = true_prev_zeta + noise
@@ -122,43 +116,32 @@ def train_model():
                 torch.zeros_like(true_prev_zeta),          # V₀ = 0
             ], dim=1)                                      # [N, 3]
 
-            # Run 1 time step (chunk_size = 1) with teacher-forced initial state
-            sim_chunk, u_pred, v_pred, _, _ = model(
-                forcing_sequence[t_idx : t_idx + 1],
+            # Run 4 time steps (chunk_size = 4) autoregressively
+            sim_chunk, u_chunk, v_chunk, _ = model(
+                forcing_sequence[t_idx : t_idx + chunk_size],
                 edge_index,
                 edge_weight,
                 nodes_xy_t,
                 open_boundary_nodes,
-                boundary_tides[t_idx : t_idx + 1] if boundary_tides is not None else None,
+                boundary_tides[t_idx : t_idx + chunk_size] if boundary_tides is not None else None,
                 prev_state,
             )
 
-            # Masked MSE loss: ignore permanently dry land nodes
-            # wet_mask[t_idx] shape: [N] bool
-            mask_t = wet_mask[t_idx].unsqueeze(0).unsqueeze(-1).float()  # [1, N, 1]
+            # Masked MSE loss for all 4 steps
+            mask_t = wet_mask[t_idx : t_idx + chunk_size].unsqueeze(-1).float()  # [chunk_size, N, 1]
             n_wet  = mask_t.sum().clamp(min=1.0)
-            data_loss = ((sim_chunk - true_zetas[t_idx : t_idx + 1])**2 * mask_t).sum() / n_wet
+            data_loss = ((sim_chunk - true_zetas[t_idx : t_idx + chunk_size])**2 * mask_t).sum() / n_wet
 
-            # Physics loss uses a 2-step window [t-1, t] so we need chunk_size >= 2
-            # Build a 2-step chunk: [prev_true_zeta, sim_zeta_t]
+            # Physics loss evaluated on the sequence
             if phys_weight > 0.0:
-                zeta_2step = torch.cat([
-                    true_prev_zeta.unsqueeze(0),  # t-1: ground truth
-                    sim_chunk,                     # t  : model prediction
-                ], dim=0)                          # [2, N, 1]
-                u_2step = torch.cat([
-                    torch.zeros_like(true_prev_zeta).unsqueeze(0),
-                    u_pred.unsqueeze(0),
-                ], dim=0)
-                v_2step = torch.cat([
-                    torch.zeros_like(true_prev_zeta).unsqueeze(0),
-                    v_pred.unsqueeze(0),
-                ], dim=0)
-                forcing_2step = forcing_sequence[t_idx - 1 : t_idx + 1]
+                zeta_phys = torch.cat([noisy_prev_zeta.unsqueeze(0), sim_chunk], dim=0)
+                u_phys = torch.cat([torch.zeros_like(true_prev_zeta).unsqueeze(0), u_chunk], dim=0)
+                v_phys = torch.cat([torch.zeros_like(true_prev_zeta).unsqueeze(0), v_chunk], dim=0)
+                forcing_phys = forcing_sequence[t_idx - 1 : t_idx + chunk_size]
 
                 phys_loss = compute_swe_physics_loss(
-                    zeta_2step, u_2step, v_2step,
-                    forcing_2step, edge_index, nodes_xy_t,
+                    zeta_phys, u_phys, v_phys,
+                    forcing_phys, edge_index, nodes_xy_t,
                     dt=900.0,
                 )
             else:
@@ -200,7 +183,7 @@ def train_model():
         with torch.no_grad():
             for start_t in range(split_idx, time_steps, 4):
                 end_t = min(start_t + 4, time_steps)
-                sim_val, _, _, _, current_state = model(
+                sim_val, _, _, current_state = model(
                     forcing_sequence[start_t:end_t],
                     edge_index,
                     edge_weight,
