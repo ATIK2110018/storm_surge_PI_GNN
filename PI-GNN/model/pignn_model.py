@@ -41,8 +41,10 @@ class ParametricPIGNN(torch.nn.Module):
         
         # Spatial inputs (X, Y) = 2
         # Physical forcing features (Depth, Pressure, TauX, TauY, Cf) = 5
-        node_in_channels = 2 + num_forcing_features
+        # Previous State (Zeta, U, V) = 3
+        node_in_channels = 2 + num_forcing_features + 3
         
+        self.feature_norm = nn.BatchNorm1d(node_in_channels)
         self.node_encoder = _mlp(node_in_channels, hidden_dim, hidden_dim)
         self.edge_encoder = _mlp(1, 8, 8) # Encode scalar edge_weight (inverse dist)
         
@@ -50,7 +52,7 @@ class ParametricPIGNN(torch.nn.Module):
             GNNLayer(hidden_dim, 8) for _ in range(n_layers)
         ])
         
-        # Output is the ABSOLUTE state: Water Level, U_velocity, and V_velocity
+        # Output: delta-state (dZeta, dU, dV) — residual over prev_state
         self.decoder = _mlp(hidden_dim, hidden_dim, 3)
 
     def forward(self, forcing_sequence, edge_index, edge_weight, nodes_xy, open_boundary_nodes=None, boundary_tides=None, initial_states=None):
@@ -69,6 +71,11 @@ class ParametricPIGNN(torch.nn.Module):
         y_norm = (nodes_xy[:, 1:2] - nodes_xy[:, 1:2].mean()) / (nodes_xy[:, 1:2].std() + 1e-6)
         xy_features = torch.cat([x_norm, y_norm], dim=1).to(device)
         
+        if initial_states is None:
+            prev_state = torch.zeros((num_nodes, 3), dtype=torch.float32, device=device)
+        else:
+            prev_state = initial_states
+            
         simulated_zetas = []
         zeta_t, u_t, v_t = None, None, None
         
@@ -88,30 +95,40 @@ class ParametricPIGNN(torch.nn.Module):
             # Replace raw Manning's n with the mathematically exact Cf
             physical_forcing = torch.cat([forcing_t[:, 0:4], Cf], dim=1)
             
-            # Combine SPATIAL parameters (X, Y) with physical forcing (Depth, Pressure, Wind, Cf)
-            node_feat = torch.cat([xy_features, physical_forcing], dim=1)
+            # Combine SPATIAL parameters (X, Y) with physical forcing (Depth, Pressure, Wind, Cf) and PREVIOUS STATE
+            node_feat = torch.cat([xy_features, physical_forcing, prev_state], dim=1)
+            
+            # Normalize all features dynamically to prevent static variables from drowning out wind stress!
+            node_feat = self.feature_norm(node_feat)
             
             # === DEEP MESSAGE PASSING ===
             h = self.node_encoder(node_feat)
             for layer in self.gnn_layers:
                 h = layer(h, src, dst, e)
                 
-            # Predict the ABSOLUTE STATE directly (Parametric PINN)
-            preds = self.decoder(h) 
-            zeta_t = preds[:, 0:1]
-            u_t = preds[:, 1:2]
-            v_t = preds[:, 2:3]
-            
+            # Predict the CHANGE in state (physically: Euler integration step)
+            preds = self.decoder(h)
+            zeta_t = prev_state[:, 0:1] + preds[:, 0:1]
+            u_t    = prev_state[:, 1:2] + preds[:, 1:2]
+            v_t    = prev_state[:, 2:3] + preds[:, 2:3]
+
+            # Clamp water level to physically plausible range (prevents runaway residuals)
+            zeta_t = torch.clamp(zeta_t, min=-10.0, max=15.0)
+
             # === DYNAMIC WETTING & DRYING (WD) ALGORITHM ===
             H_check = depth + zeta_t
             wd_mask = (H_check > 0.05).float()
             u_t = u_t * wd_mask
             v_t = v_t * wd_mask
-            
+
             # === EXPLICIT TIDAL BOUNDARY FORCING (Dirichlet BC) ===
+            # boundary_tides[t] shape: [num_bnodes] — each boundary node gets its
+            # own individual tidal amplitude from fort.15 harmonic constituents.
             if open_boundary_nodes is not None and boundary_tides is not None:
+                zeta_t = zeta_t.clone()  # avoid in-place op on computation graph
                 zeta_t[open_boundary_nodes, 0] = boundary_tides[t]
                 
+            prev_state = torch.cat([zeta_t, u_t, v_t], dim=1)
             simulated_zetas.append(zeta_t)
             
-        return torch.stack(simulated_zetas, dim=0), zeta_t, u_t, v_t
+        return torch.stack(simulated_zetas, dim=0), zeta_t, u_t, v_t, prev_state

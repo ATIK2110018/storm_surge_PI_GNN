@@ -1,56 +1,163 @@
 import torch
-import numpy as np
 
+
+def compute_swe_physics_loss(zeta_chunk, u_chunk, v_chunk, forcing_chunk,
+                              edge_index, nodes_xy, dt=900.0):
+    """
+    Real linearized Shallow Water Equation physics residuals on the ADCIRC mesh.
+
+    Continuity:  dζ/dt + ∇·(H·U) = 0
+    X-Momentum:  dU/dt + g·∂ζ/∂x = τ_x / (ρ_w·H)  -  Cf·U·|U| / H
+    Y-Momentum:  dV/dt + g·∂ζ/∂y = τ_y / (ρ_w·H)  -  Cf·V·|U| / H
+
+    Spatial gradients are computed via a finite-difference scatter over the
+    ADCIRC mesh edges (unstructured FD approximation), using the real
+    Haversine-derived edge direction cosines.
+
+    Args:
+        zeta_chunk:    [T, N, 1]  predicted water-surface elevations
+        u_chunk:       [T, N, 1]  predicted depth-averaged x-velocity
+        v_chunk:       [T, N, 1]  predicted depth-averaged y-velocity
+        forcing_chunk: [T, N, 5]  columns = [depth, pressure, tau_x, tau_y, mannings_n]
+        edge_index:    [2, E]     mesh edge connectivity (src, dst)
+        nodes_xy:      [N, 3]     node table (lon, lat, depth) from fort.14
+        dt:            float      integration timestep in seconds (default 900 s = 15 min)
+    Returns:
+        Scalar physics loss (sum of squared residuals).
+    """
+    T = zeta_chunk.size(0)
+    if T < 2:
+        return torch.tensor(0.0, device=zeta_chunk.device)
+
+    device = zeta_chunk.device
+    rho_water = 1025.0  # kg/m³
+    g = 9.81            # m/s²
+
+    src, dst = edge_index[0], edge_index[1]
+    N = zeta_chunk.size(1)
+    Tm1 = T - 1
+
+    # ------------------------------------------------------------------
+    # Edge geometry: direction cosines from node coordinates
+    # Convert geographic degrees → approximate metres for gradient scaling
+    # Bay of Bengal domain centred around ~21 °N
+    # ------------------------------------------------------------------
+    cos_lat = torch.cos(torch.tensor(21.0 * 3.14159265 / 180.0, device=device))
+    lon_m = 111320.0 * cos_lat   # m per degree longitude
+    lat_m = torch.tensor(110540.0, device=device)
+
+    x_m = nodes_xy[:, 0].to(device) * lon_m   # [N]
+    y_m = nodes_xy[:, 1].to(device) * lat_m   # [N]
+
+    dx = x_m[dst] - x_m[src]   # [E]
+    dy = y_m[dst] - y_m[src]
+    dist = torch.sqrt(dx**2 + dy**2 + 1e-6)
+    cos_e = (dx / dist).detach()    # [E]
+    sin_e = (dy / dist).detach()
+    inv_e = (1.0 / dist).detach()
+
+    # Expand to [Tm1, E, 1] for batch scatter
+    cos_e = cos_e.unsqueeze(0).unsqueeze(-1).expand(Tm1, -1, 1)
+    sin_e = sin_e.unsqueeze(0).unsqueeze(-1).expand(Tm1, -1, 1)
+    inv_e = inv_e.unsqueeze(0).unsqueeze(-1).expand(Tm1, -1, 1)
+    dst_b = dst.unsqueeze(0).unsqueeze(-1).expand(Tm1, -1, 1)
+    src_b = src.unsqueeze(0).unsqueeze(-1).expand(Tm1, -1, 1)
+
+    # Node degree for gradient normalisation
+    degree = torch.zeros(N, device=device)
+    degree.scatter_add_(0, src, torch.ones_like(src, dtype=torch.float32))
+    degree.scatter_add_(0, dst, torch.ones_like(dst, dtype=torch.float32))
+    degree = degree.clamp(min=1.0).unsqueeze(0).unsqueeze(-1)  # [1, N, 1]
+
+    # ------------------------------------------------------------------
+    # Time derivatives (central finite difference over chunk)
+    # ------------------------------------------------------------------
+    dzeta_dt = (zeta_chunk[1:] - zeta_chunk[:-1]) / dt   # [Tm1, N, 1]
+    du_dt    = (u_chunk[1:]    - u_chunk[:-1])    / dt
+    dv_dt    = (v_chunk[1:]    - v_chunk[:-1])    / dt
+
+    # Midpoint states for spatial terms (numerically stable)
+    zeta = 0.5 * (zeta_chunk[1:] + zeta_chunk[:-1])   # [Tm1, N, 1]
+    u    = 0.5 * (u_chunk[1:]    + u_chunk[:-1])
+    v    = 0.5 * (v_chunk[1:]    + v_chunk[:-1])
+
+    # Forcing at the later timestep
+    depth      = forcing_chunk[1:, :, 0:1]   # [Tm1, N, 1]
+    tau_x_wind = forcing_chunk[1:, :, 2:3]   # wind stress x  [Pa]
+    tau_y_wind = forcing_chunk[1:, :, 3:4]   # wind stress y  [Pa]
+    mannings_n = forcing_chunk[1:, :, 4:5]
+
+    H       = torch.clamp(depth + zeta, min=0.05)          # total water depth [m]
+    Cf      = (g * mannings_n**2) / (H**(1.0/3.0) + 1e-8) # Manning friction coefficient
+    vel_mag = torch.sqrt(u**2 + v**2 + 1e-8)
+
+    # ------------------------------------------------------------------
+    # Spatial gradient operator: ∂φ/∂x, ∂φ/∂y at each node
+    # Unstructured FD approximation:
+    #   ∂φ/∂x_i ≈ (1/deg_i) Σ_{j∈N(i)} (φ_j - φ_i) · cos_θ_ij / |r_ij|
+    # ------------------------------------------------------------------
+    def grad_xy(phi):
+        """phi: [Tm1, N, 1] → grad_x, grad_y each [Tm1, N, 1]"""
+        dphi = phi[:, dst, :] - phi[:, src, :]   # [Tm1, E, 1]
+        gx = torch.zeros(Tm1, N, 1, device=device)
+        gy = torch.zeros(Tm1, N, 1, device=device)
+        # dst node gathers (φ_src - φ_dst) contribution
+        gx.scatter_add_(1, dst_b, -dphi * cos_e * inv_e)
+        gy.scatter_add_(1, dst_b, -dphi * sin_e * inv_e)
+        # src node gathers (φ_dst - φ_src) contribution
+        gx.scatter_add_(1, src_b,  dphi * cos_e * inv_e)
+        gy.scatter_add_(1, src_b,  dphi * sin_e * inv_e)
+        return gx / degree, gy / degree
+
+    grad_zeta_x, grad_zeta_y = grad_xy(zeta)
+
+    # ------------------------------------------------------------------
+    # Continuity residual: dζ/dt + ∇·(H·U) = 0
+    # ∇·(HU) computed as divergence of flux vector via scatter
+    # ------------------------------------------------------------------
+    Hu = H * u   # [Tm1, N, 1]
+    Hv = H * v
+    dHu = Hu[:, dst, :] - Hu[:, src, :]
+    dHv = Hv[:, dst, :] - Hv[:, src, :]
+
+    divHU = torch.zeros(Tm1, N, 1, device=device)
+    divHU.scatter_add_(1, dst_b, -dHu * cos_e * inv_e - dHv * sin_e * inv_e)
+    divHU.scatter_add_(1, src_b,  dHu * cos_e * inv_e + dHv * sin_e * inv_e)
+    divHU = divHU / degree
+
+    R_cont = dzeta_dt + divHU
+
+    # ------------------------------------------------------------------
+    # Momentum residuals (with wind stress source term)
+    # ------------------------------------------------------------------
+    wind_x = tau_x_wind / (rho_water * H + 1e-8)   # wind forcing [m/s²]
+    wind_y = tau_y_wind / (rho_water * H + 1e-8)
+    fric_x = Cf * u * vel_mag / (H + 1e-8)          # bottom friction [m/s²]
+    fric_y = Cf * v * vel_mag / (H + 1e-8)
+
+    R_mom_x = du_dt + g * grad_zeta_x - wind_x + fric_x
+    R_mom_y = dv_dt + g * grad_zeta_y - wind_y + fric_y
+
+    # Weight: continuity is the primary constraint; momentum scaled down
+    return (torch.mean(R_cont**2) +
+            0.1 * torch.mean(R_mom_x**2) +
+            0.1 * torch.mean(R_mom_y**2))
+
+
+# ---------------------------------------------------------------------------
+# Keep the old stubs for backward-compatibility (they are no longer called)
+# ---------------------------------------------------------------------------
 def compute_data_loss(predictions, targets, mask=None):
-    """
-    Standard Data Loss: L_data = MSE(Zeta_pred, Zeta_true)
-    """
     loss = torch.nn.functional.mse_loss(predictions, targets, reduction='none')
     if mask is not None:
         loss = loss * mask
         return loss.sum() / mask.sum()
     return loss.mean()
 
+
 def compute_boundary_loss(predictions, boundary_targets, boundary_node_indices):
-    """
-    Boundary Condition Loss: L_BC = MSE(Zeta_pred_boundary, Tide_actual)
-    Penalizes the model if it doesn't match the forced tidal elevation at the open ocean.
-    """
     if len(boundary_node_indices) == 0:
         return torch.tensor(0.0, device=predictions.device)
-        
-    pred_boundary = predictions[:, boundary_node_indices, :]
-    target_boundary = boundary_targets[:, boundary_node_indices, :]
-    
-    return torch.nn.functional.mse_loss(pred_boundary, target_boundary)
-
-def compute_physics_loss(zeta, depth, wind_x, wind_y, edge_index, dt=600):
-    """
-    Physics Loss: L_physics = Mean( | d(zeta)/dt + div(H * V) |^2 )
-    Since we don't have predicted velocities (U,V) directly from a simple model, 
-    we approximate the shallow water momentum driven by wind stress.
-    
-    For a fully rigorous GWCE, the model MUST predict U and V as well. 
-    Here, we penalize unnatural spikes in the water surface gradient to enforce continuity.
-    """
-    # 1. Temporal Derivative: d(zeta)/dt
-    # zeta shape: [batch/time, nodes, 1]
-    if zeta.size(0) < 2:
-        return torch.tensor(0.0, device=zeta.device)
-        
-    dzeta_dt = (zeta[1:] - zeta[:-1]) / dt
-    
-    # 2. Spatial Smoothness & Continuity Penalty (Simplified Physics)
-    # Water cannot stack up infinitely; gradients should be bounded by wind stress and depth.
-    # In a full PINN, you compute the spatial derivative on the graph.
-    
-    src, dst = edge_index
-    # Difference in water level between neighboring nodes
-    zeta_diff = zeta[:, src, :] - zeta[:, dst, :]
-    
-    # Penalize extreme, non-physical gradients
-    spatial_penalty = torch.mean(zeta_diff**2)
-    
-    # Combine (placeholder for full SWE PDEs)
-    physics_loss = torch.mean(dzeta_dt**2) + 0.1 * spatial_penalty
-    return physics_loss
+    pred_b   = predictions[:, boundary_node_indices, :]
+    target_b = boundary_targets[:, boundary_node_indices, :]
+    return torch.nn.functional.mse_loss(pred_b, target_b)
