@@ -117,24 +117,32 @@ class ParametricPIGNN(torch.nn.Module):
         else:
             obn = None
 
+        # T_out = number of timesteps to OUTPUT (from boundary_tides or 1).
+        # The full forcing_sequence is used ONLY for lag lookups via global_t.
+        T_out = boundary_tides.size(0) if boundary_tides is not None else 1
+
         simulated_zetas, simulated_u, simulated_v = [], [], []
 
-        for t in range(T):
+        for t in range(T_out):
+            # Global timestep index into the FULL forcing_sequence
+            global_t = t_start + t
+
             # ----------------------------------------------------------------
             # BUILD LAGGED FORCING FEATURES
-            # We look up lags from the FULL forcing_sequence using the global
-            # time index (t_start + t), clamped to 0 to avoid negative indices.
-            # Features used: [dP/dx, dP/dy, tau_x, tau_y] (cols 1,2,3,4)
+            # Current + (n_lags-1) past timesteps of [dP/dx, dP/dy, tau_x, tau_y]
             # ----------------------------------------------------------------
-            global_t = t_start + t
             lag_feats = []
             for k in range(self.n_lags):
                 lag_t = max(0, global_t - k)
                 lag_feats.append(forcing_sequence[lag_t, :, 1:5])  # [N, 4]
             lagged = torch.cat(lag_feats, dim=1)  # [N, n_lags*4]
 
+            # Depth and mannings from current global timestep
+            depth_t    = forcing_sequence[global_t, :, 0:1]
+            mannings_t = forcing_sequence[global_t, :, 5:6]
+
             # Full node feature vector
-            node_feat = torch.cat([xy_feat, depth_feat, lagged, mannings_feat], dim=1)
+            node_feat = torch.cat([xy_feat, depth_t, lagged, mannings_t], dim=1)
 
             # === DEEP MESSAGE PASSING ===
             h = self.node_encoder(node_feat)
@@ -148,12 +156,13 @@ class ParametricPIGNN(torch.nn.Module):
             v_t    = preds[:, 2:3]
 
             # === DYNAMIC WETTING & DRYING ===
-            H_check = depth_feat + zeta_t
+            H_check = depth_t + zeta_t
             wd_mask = (H_check > 0.05).float()
             u_t = u_t * wd_mask
             v_t = v_t * wd_mask
 
             # === EXPLICIT TIDAL BOUNDARY FORCING (Dirichlet BC) ===
+            # boundary_tides[t] is the t-th entry of the PASSED slice (size T_out)
             if obn is not None and boundary_tides is not None:
                 zeta_t = zeta_t.clone()
                 zeta_t[obn, 0] = boundary_tides[t]
