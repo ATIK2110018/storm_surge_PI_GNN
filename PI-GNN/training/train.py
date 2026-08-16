@@ -62,7 +62,7 @@ def train_model():
 
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.97)
-    criterion = torch.nn.MSELoss()
+    # criterion = torch.nn.MSELoss() (removed: using manual masked loss)
 
     # Training indices: skip t=0 so teacher-forcing always has a valid t-1
     # Randomize each epoch — prevents the model from learning to copy prev_state

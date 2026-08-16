@@ -137,6 +137,7 @@ def haversine_distance(lon1, lat1, lon2, lat2):
     dlon = lon2 - lon1
     dlat = lat2 - lat1
     a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+    a = np.clip(a, 0.0, 1.0)  # BUG 8 FIX: Prevent NaN from precision issues
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
     return R * c
 
@@ -316,13 +317,15 @@ def create_full_simulation_dataset(f14, f22, f63):
     # Assemble 6-feature forcing tensor [T, N, 6]
     depth_np   = nodes[:, 2].astype(np.float32)           # [N] positive-down depth
     manning_np = mannings_n.squeeze().numpy()             # [N]
+    
+    # BUG 6 FIX: Use np.tile instead of broadcast_to to prevent memory doubling in np.stack
     f_all = np.stack([
-        np.broadcast_to(depth_np,   (time_steps, _N)),   # col 0: depth
+        np.tile(depth_np, (time_steps, 1)),               # col 0: depth
         grad_px_all,                                      # col 1: dP/dx [Pa/m]
         grad_py_all,                                      # col 2: dP/dy [Pa/m]
         tau_x_all,                                        # col 3: tau_x [Pa]
         tau_y_all,                                        # col 4: tau_y [Pa]
-        np.broadcast_to(manning_np, (time_steps, _N)),   # col 5: Manning n
+        np.tile(manning_np, (time_steps, 1)),             # col 5: Manning n
     ], axis=2)                                            # [T, N, 6]
     forcing_sequence = torch.tensor(f_all, dtype=torch.float32)
     

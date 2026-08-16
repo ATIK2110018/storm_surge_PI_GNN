@@ -62,8 +62,10 @@ def compute_swe_physics_loss(zeta_chunk, u_chunk, v_chunk, forcing_chunk,
     cos_e = cos_e.unsqueeze(0).unsqueeze(-1).expand(Tm1, -1, 1)
     sin_e = sin_e.unsqueeze(0).unsqueeze(-1).expand(Tm1, -1, 1)
     inv_e = inv_e.unsqueeze(0).unsqueeze(-1).expand(Tm1, -1, 1)
-    dst_b = dst.unsqueeze(0).unsqueeze(-1).expand(Tm1, -1, 1)
-    src_b = src.unsqueeze(0).unsqueeze(-1).expand(Tm1, -1, 1)
+    
+    # BUG 9 FIX: scatter_add_ requires contiguous index tensors on GPU
+    dst_b = dst.unsqueeze(0).unsqueeze(-1).expand(Tm1, -1, 1).contiguous()
+    src_b = src.unsqueeze(0).unsqueeze(-1).expand(Tm1, -1, 1).contiguous()
 
     # Node degree for gradient normalisation
     degree = torch.zeros(N, device=device)
