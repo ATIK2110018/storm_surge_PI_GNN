@@ -40,7 +40,7 @@ class ParametricPIGNN(torch.nn.Module):
     """
     Non-autoregressive PI-GNN for storm surge prediction.
     """
-    def __init__(self, num_nodes, num_forcing_features=6, hidden_dim=32, n_layers=3,
+    def __init__(self, num_nodes, num_forcing_features=6, hidden_dim=64, n_layers=4,
                  n_lags=N_FORCING_LAGS):
         super(ParametricPIGNN, self).__init__()
         self.n_lags = n_lags
