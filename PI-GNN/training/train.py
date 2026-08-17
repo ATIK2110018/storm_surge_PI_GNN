@@ -165,6 +165,7 @@ def train_model():
                 phys_loss = compute_swe_physics_loss(
                     zeta_phys, u_phys, v_phys,
                     forcing_sequence[t_idx - 1 : t_idx + 1], edge_index, nodes_xy_t, dt=900.0,
+                    mask=mask_t
                 )
             else:
                 phys_loss = torch.tensor(0.0, device=device)

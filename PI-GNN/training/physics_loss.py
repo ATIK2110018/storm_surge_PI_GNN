@@ -2,7 +2,7 @@ import torch
 
 
 def compute_swe_physics_loss(zeta_chunk, u_chunk, v_chunk, forcing_chunk,
-                              edge_index, nodes_xy, dt=900.0):
+                              edge_index, nodes_xy, dt=900.0, mask=None):
     """
     Real linearized Shallow Water Equation physics residuals on the ADCIRC mesh.
 
@@ -108,11 +108,11 @@ def compute_swe_physics_loss(zeta_chunk, u_chunk, v_chunk, forcing_chunk,
         gx = torch.zeros(Tm1, N, 1, device=device)
         gy = torch.zeros(Tm1, N, 1, device=device)
         # dst node gathers (φ_src - φ_dst) contribution
-        gx.scatter_add_(1, dst_b, -dphi * cos_e * inv_e)
-        gy.scatter_add_(1, dst_b, -dphi * sin_e * inv_e)
+        gx.scatter_add_(1, dst_b, dphi * cos_e * inv_e)
+        gy.scatter_add_(1, dst_b, dphi * sin_e * inv_e)
         # src node gathers (φ_dst - φ_src) contribution
-        gx.scatter_add_(1, src_b,  dphi * cos_e * inv_e)
-        gy.scatter_add_(1, src_b,  dphi * sin_e * inv_e)
+        gx.scatter_add_(1, src_b, dphi * cos_e * inv_e)
+        gy.scatter_add_(1, src_b, dphi * sin_e * inv_e)
         return gx / degree, gy / degree
 
     grad_zeta_x, grad_zeta_y = grad_xy(zeta)
@@ -127,8 +127,8 @@ def compute_swe_physics_loss(zeta_chunk, u_chunk, v_chunk, forcing_chunk,
     dHv = Hv[:, dst, :] - Hv[:, src, :]
 
     divHU = torch.zeros(Tm1, N, 1, device=device)
-    divHU.scatter_add_(1, dst_b, -dHu * cos_e * inv_e - dHv * sin_e * inv_e)
-    divHU.scatter_add_(1, src_b,  dHu * cos_e * inv_e + dHv * sin_e * inv_e)
+    divHU.scatter_add_(1, dst_b, dHu * cos_e * inv_e + dHv * sin_e * inv_e)
+    divHU.scatter_add_(1, src_b, dHu * cos_e * inv_e + dHv * sin_e * inv_e)
     divHU = divHU / degree
 
     R_cont = dzeta_dt + divHU
@@ -158,10 +158,18 @@ def compute_swe_physics_loss(zeta_chunk, u_chunk, v_chunk, forcing_chunk,
     R_mom_x_scaled = R_mom_x * 1000.0  # Scale up by 1e3
     R_mom_y_scaled = R_mom_y * 1000.0
 
-    # Weight: continuity is the primary constraint; momentum scaled down
-    return (torch.mean(R_cont_scaled**2) +
-            0.1 * torch.mean(R_mom_x_scaled**2) +
-            0.1 * torch.mean(R_mom_y_scaled**2))
+    if mask is not None:
+        R_cont_scaled = R_cont_scaled * mask
+        R_mom_x_scaled = R_mom_x_scaled * mask
+        R_mom_y_scaled = R_mom_y_scaled * mask
+        n_wet = mask.sum().clamp(min=1.0)
+        return (torch.sum(R_cont_scaled**2) / n_wet +
+                0.1 * torch.sum(R_mom_x_scaled**2) / n_wet +
+                0.1 * torch.sum(R_mom_y_scaled**2) / n_wet)
+    else:
+        return (torch.mean(R_cont_scaled**2) +
+                0.1 * torch.mean(R_mom_x_scaled**2) +
+                0.1 * torch.mean(R_mom_y_scaled**2))
 
 
 # ---------------------------------------------------------------------------
