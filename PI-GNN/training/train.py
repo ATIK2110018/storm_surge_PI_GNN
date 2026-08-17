@@ -23,11 +23,7 @@ def train_model():
             print(f"CRITICAL ERROR: {f} not found!")
             return
 
-    # -----------------------------------------------------------------------
-    # Non-autoregressive curriculum (mirrors FlowFM project that solved drift)
-    # Each time step is predicted INDEPENDENTLY from lagged forcing history.
-    # No hidden state is passed forward → zero autoregressive drift possible.
-    # -----------------------------------------------------------------------
+    # Non-autoregressive setup
     epochs        = 60
     learning_rate = 5e-4
 
@@ -77,16 +73,12 @@ def train_model():
 
     for epoch in range(1, epochs + 1):
 
-        # Physics weight schedule (60-Epoch Curriculum)
-        if epoch <= 30:
-            phys_weight = 0.0
-            stage = "Data-Only Pre-training"
-        elif epoch <= 40:
-            phys_weight = 0.5 + 3.5 * (epoch - 31) / (40 - 31)
-            stage = f"Physics Ramp-Up (w={phys_weight:.2f})"
-        else:
-            phys_weight = 4.0
-            stage = "Full Physics"
+        # Fixed weight schedule as requested
+        w_data = 10.0
+        w_bc   = 20.0
+        w_ic   = 20.0
+        w_phys = 4.0
+        stage = f"Train (D:{w_data}, BC:{w_bc}, IC:{w_ic}, P:{w_phys})"
 
         # Use full available steps immediately (no window curriculum)
         window      = total_t
@@ -105,9 +97,7 @@ def train_model():
         for step, t_idx in enumerate(t_sample):
             optimizer.zero_grad()
 
-            # NON-AUTOREGRESSIVE FORWARD PASS
-            # The model uses the FULL forcing_sequence internally to build
-            # lagged features for timestep t_idx. No prev_state needed.
+            # Forward pass
             sim_t, u_t, v_t, _ = model(
                 forcing_sequence,          # full sequence for lag lookup
                 edge_index, edge_weight, nodes_xy_t,
@@ -116,7 +106,7 @@ def train_model():
                 t_start=int(t_idx),
             )
 
-            # Masked MSE loss
+            # Masked MSE loss (Data loss)
             mask_t = wet_mask[t_idx].unsqueeze(0).unsqueeze(-1).float()
             n_wet  = mask_t.sum().clamp(min=1.0)
             data_loss_zeta = ((sim_t - true_zetas[t_idx : t_idx + 1])**2 * mask_t).sum() / n_wet
@@ -127,11 +117,32 @@ def train_model():
                 data_loss_v = ((v_t - true_vvels[t_idx : t_idx + 1])**2 * mask_t).sum() / n_wet
                 data_loss_uv = data_loss_u + data_loss_v
             
-            # Velocity values are typically smaller than surge elevations; weight them equally for now
             data_loss = data_loss_zeta + 1.0 * data_loss_uv
 
-            # Physics loss: use t-1 prediction (also non-autoregressive)
-            if phys_weight > 0.0:
+            # Boundary Condition (BC) Loss
+            if open_boundary_nodes is not None and len(open_boundary_nodes) > 0:
+                obn_idx = torch.tensor(open_boundary_nodes, dtype=torch.long, device=device)
+                bc_loss = ((sim_t[0, obn_idx, 0] - true_zetas[t_idx, obn_idx, 0])**2).mean()
+            else:
+                bc_loss = torch.tensor(0.0, device=device)
+
+            # Initial Condition (IC) Loss (evaluated at the first valid timestep)
+            ic_t = N_FORCING_LAGS
+            sim_ic, u_ic, v_ic, _ = model(
+                forcing_sequence, edge_index, edge_weight, nodes_xy_t,
+                open_boundary_nodes,
+                boundary_tides[ic_t : ic_t + 1] if boundary_tides is not None else None,
+                t_start=int(ic_t)
+            )
+            mask_ic = wet_mask[ic_t].unsqueeze(0).unsqueeze(-1).float()
+            n_wet_ic = mask_ic.sum().clamp(min=1.0)
+            ic_loss = ((sim_ic - true_zetas[ic_t : ic_t + 1])**2 * mask_ic).sum() / n_wet_ic
+            if true_uvels is not None:
+                ic_loss += ((u_ic - true_uvels[ic_t : ic_t + 1])**2 * mask_ic).sum() / n_wet_ic
+                ic_loss += ((v_ic - true_vvels[ic_t : ic_t + 1])**2 * mask_ic).sum() / n_wet_ic
+
+            # Physics loss
+            if w_phys > 0.0:
                 with torch.no_grad():
                     sim_tm1, u_tm1, v_tm1, _ = model(
                         forcing_sequence,
@@ -150,28 +161,26 @@ def train_model():
             else:
                 phys_loss = torch.tensor(0.0, device=device)
 
-            loss = data_loss + phys_weight * phys_loss
+            loss = (w_data * data_loss) + (w_bc * bc_loss) + (w_ic * ic_loss) + (w_phys * phys_loss)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             epoch_data_loss += data_loss.item()
-            epoch_phys_loss += phys_loss.item() if phys_weight > 0 else 0.0
+            epoch_phys_loss += phys_loss.item() if w_phys > 0 else 0.0
 
             if (step + 1) % 200 == 0 or step == steps_per_epoch - 1:
                 avg_d = epoch_data_loss / (step + 1)
                 avg_p = epoch_phys_loss / (step + 1)
                 print(f"  Step {step + 1}/{steps_per_epoch} | "
-                      f"Data: {avg_d:.5f} | Phys: {avg_p:.5f} | "
+                      f"Data: {avg_d:.5f} | BC: {bc_loss.item():.5f} | IC: {ic_loss.item():.5f} | Phys: {avg_p:.5f} | "
                       f"LR: {scheduler.get_last_lr()[0]:.2e}")
 
         scheduler.step()
 
         avg_epoch_data = epoch_data_loss / steps_per_epoch
 
-        # ===== VALIDATION PHASE =====
-        # With non-autoregressive model, validation is simply predicting each
-        # test timestep independently — no state initialization needed.
+        # Validation phase
         model.eval()
         val_loss_total = 0.0
         val_chunks = 0

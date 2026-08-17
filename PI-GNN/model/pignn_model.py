@@ -1,17 +1,8 @@
 import torch
 import torch.nn as nn
 
-# -----------------------------------------------------------------------
-# Lag Configuration (mirrors the FlowFM architecture that solved drift)
-# -----------------------------------------------------------------------
-# We pass N_LAGS past timesteps of wind/pressure forcing to every node.
-# This gives the GNN a "memory" of the storm's evolution without any
-# recurrent hidden state — which was the root cause of autoregressive drift.
-#
-# At 15-min resolution, 8 lags = 2 hours of atmospheric forcing history.
-# This covers the atmospheric spin-up time for surge development.
+# Lag Configuration
 N_FORCING_LAGS = 8   # number of lagged forcing snapshots (including current)
-# -----------------------------------------------------------------------
 
 
 def _mlp(in_dim, hidden_dim, out_dim, n_hidden=1):
@@ -48,14 +39,6 @@ class GNNLayer(nn.Module):
 class ParametricPIGNN(torch.nn.Module):
     """
     Non-autoregressive PI-GNN for storm surge prediction.
-
-    ARCHITECTURE (identical to FlowFM surrogate that solved drift):
-      - Input per node: [X, Y, Depth, lag_0..lag_N of (dP/dx, dP/dy, tau_x, tau_y)]
-      - Output per node: [zeta, u, v] at current timestep (ABSOLUTE, not delta)
-      - No hidden state passed forward → zero autoregressive drift
-
-    The GNN propagates tidal/surge information spatially along mesh edges
-    via message passing, learning the spatial phase response of the surge.
     """
     def __init__(self, num_nodes, num_forcing_features=6, hidden_dim=32, n_layers=3,
                  n_lags=N_FORCING_LAGS):
@@ -63,11 +46,8 @@ class ParametricPIGNN(torch.nn.Module):
         self.n_lags = n_lags
 
         # Node input: XY(2) + depth(1) + lagged_forcing(n_lags * 5) + mannings(1)
-        # Lagged features: [dP/dx, dP/dy, tau_x, tau_y, mean_bt] × n_lags
-        # mean_bt (col 6) is the mean open-boundary tidal elevation — the KEY
-        # signal that tells the model the tidal phase at each timestep.
-        n_lagged_feat = n_lags * 5   # 8 lags × 5 features = 40
-        node_in_channels = 2 + 1 + n_lagged_feat + 1  # XY + depth + lags + mannings = 44
+        n_lagged_feat = n_lags * 5
+        node_in_channels = 2 + 1 + n_lagged_feat + 1
 
         self.node_encoder = _mlp(node_in_channels, hidden_dim, hidden_dim)
         self.edge_encoder = _mlp(1, 16, 16)
@@ -76,7 +56,7 @@ class ParametricPIGNN(torch.nn.Module):
             GNNLayer(hidden_dim, 16) for _ in range(n_layers)
         ])
 
-        # Output: ABSOLUTE (zeta, u, v) — no delta, no drift
+        # Output: (zeta, u, v)
         self.decoder = _mlp(hidden_dim, hidden_dim, 3)
 
     def forward(self, forcing_sequence, edge_index, edge_weight, nodes_xy,
@@ -88,12 +68,8 @@ class ParametricPIGNN(torch.nn.Module):
             edge_index, edge_weight, nodes_xy: graph topology
             open_boundary_nodes: Dirichlet BC node list
             boundary_tides:   [T, n_obn] water level at open boundary nodes
-            initial_states:   ignored (kept for API compatibility)
-            t_start:          global timestep index of forcing_sequence[0] in the
-                              FULL sequence — used for lag lookup.
-                              Callers should pass the full forcing tensor and
-                              set T to the desired window size via slicing, OR
-                              pass the full tensor with t_start for single-step calls.
+            initial_states:   ignored
+            t_start:          global timestep index of forcing_sequence[0]
         """
         T = forcing_sequence.size(0)
         N = forcing_sequence.size(1)
@@ -129,25 +105,18 @@ class ParametricPIGNN(torch.nn.Module):
             # Global timestep index into the FULL forcing_sequence
             global_t = t_start + t
 
-            # ----------------------------------------------------------------
-            # BUILD LAGGED FORCING FEATURES
-            # Current + (n_lags-1) past timesteps of [dP/dx, dP/dy, tau_x, tau_y]
-            # ----------------------------------------------------------------
+            # Build lagged forcing features
             lag_feats = []
             for k in range(self.n_lags):
                 lag_t = max(0, global_t - k)
-                # Extract lag features: [dP/dx (1), dP/dy (2), tau_x (3), tau_y (4), mean_bt (6)]
-                # mean_bt is CRITICAL: it tells the model the tidal phase!
-                # (We skip column 5 because it is Manning's n, which is constant and not a lag feature)
                 cols = [1, 2, 3, 4, 6]
                 raw_lag = forcing_sequence[lag_t, :, cols].clone()
                 
-                # Apply fixed physical scaling to normalize features for the MLP
-                raw_lag[:, 0] *= 100.0   # dP/dx (typically very small, ~0.01)
+                # Normalize features
+                raw_lag[:, 0] *= 100.0   # dP/dx
                 raw_lag[:, 1] *= 100.0   # dP/dy
-                raw_lag[:, 2] *= 0.2     # tau_x (typically up to ~5)
+                raw_lag[:, 2] *= 0.2     # tau_x
                 raw_lag[:, 3] *= 0.2     # tau_y
-                # raw_lag[:, 4] is mean_bt (column 6), typically -2 to 2, no scaling needed
                 
                 lag_feats.append(raw_lag)  # [N, 5]
             lagged = torch.cat(lag_feats, dim=1)  # [N, n_lags*5]
@@ -161,25 +130,24 @@ class ParametricPIGNN(torch.nn.Module):
             # Full node feature vector
             node_feat = torch.cat([xy_feat, depth_t, lagged, mannings_t], dim=1)
 
-            # === DEEP MESSAGE PASSING ===
+            # Message passing
             h = self.node_encoder(node_feat)
             for layer in self.gnn_layers:
                 h = layer(h, src, dst, e)
 
-            # Predict ABSOLUTE state (no recurrence, no drift possible)
+            # Predict state
             preds  = self.decoder(h)
             zeta_t = torch.clamp(preds[:, 0:1], min=-10.0, max=15.0)
             u_t    = preds[:, 1:2]
             v_t    = preds[:, 2:3]
 
-            # === DYNAMIC WETTING & DRYING ===
+            # Wetting & Drying
             H_check = raw_depth_t + zeta_t
             wd_mask = (H_check > 0.05).float()
             u_t = u_t * wd_mask
             v_t = v_t * wd_mask
 
-            # === EXPLICIT TIDAL BOUNDARY FORCING (Dirichlet BC) ===
-            # boundary_tides[t] is the t-th entry of the PASSED slice (size T_out)
+            # Dirichlet BC
             if obn is not None and boundary_tides is not None:
                 zeta_t = zeta_t.clone()
                 zeta_t[obn, 0] = boundary_tides[t]
