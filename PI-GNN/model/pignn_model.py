@@ -147,10 +147,10 @@ class ParametricPIGNN(torch.nn.Module):
             u_t = u_t * wd_mask
             v_t = v_t * wd_mask
 
-            # Dirichlet BC
-            if obn is not None and boundary_tides is not None:
-                zeta_t = zeta_t.clone()
-                zeta_t[obn, 0] = boundary_tides[t]
+            # Soft BC (Network learns the boundary, no hard overwrite)
+            # if obn is not None and boundary_tides is not None:
+            #     zeta_t = zeta_t.clone()
+            #     zeta_t[obn, 0] = boundary_tides[t]
 
             simulated_zetas.append(zeta_t)
             simulated_u.append(u_t)

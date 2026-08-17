@@ -73,12 +73,20 @@ def train_model():
 
     for epoch in range(1, epochs + 1):
 
-        # Fixed weight schedule as requested
+        # Curriculum weight schedule
         w_data = 10.0
         w_bc   = 20.0
         w_ic   = 20.0
-        w_phys = 4.0
-        stage = f"Train (D:{w_data}, BC:{w_bc}, IC:{w_ic}, P:{w_phys})"
+        
+        if epoch <= 10:
+            w_phys = 0.0
+            stage = f"Data-Only (D:{w_data}, BC:{w_bc}, IC:{w_ic})"
+        elif epoch <= 20:
+            w_phys = 4.0 * (epoch - 10) / (20 - 10)
+            stage = f"Physics Ramp-Up (P:{w_phys:.2f})"
+        else:
+            w_phys = 4.0
+            stage = f"Full Physics (P:{w_phys:.2f})"
 
         # Use full available steps immediately (no window curriculum)
         window      = total_t
