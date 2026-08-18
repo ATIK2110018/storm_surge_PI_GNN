@@ -5,11 +5,11 @@ import torch.nn as nn
 N_FORCING_LAGS = 8   # number of lagged forcing snapshots (including current)
 
 
-def _mlp(in_dim, hidden_dim, out_dim, n_hidden=1):
-    """Build a small MLP with SiLU activations."""
-    layers = [nn.Linear(in_dim, hidden_dim), nn.SiLU()]
+def _mlp(in_dim, hidden_dim, out_dim, n_hidden=2):
+    """Build a deeper MLP with LayerNorm and SiLU activations."""
+    layers = [nn.Linear(in_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU()]
     for _ in range(n_hidden - 1):
-        layers += [nn.Linear(hidden_dim, hidden_dim), nn.SiLU()]
+        layers += [nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU()]
     layers.append(nn.Linear(hidden_dim, out_dim))
     return nn.Sequential(*layers)
 
@@ -40,7 +40,7 @@ class ParametricPIGNN(torch.nn.Module):
     """
     Non-autoregressive PI-GNN for storm surge prediction.
     """
-    def __init__(self, num_nodes, num_forcing_features=6, hidden_dim=64, n_layers=4,
+    def __init__(self, num_nodes, num_forcing_features=6, hidden_dim=64, n_layers=5,
                  n_lags=N_FORCING_LAGS):
         super(ParametricPIGNN, self).__init__()
         self.n_lags = n_lags
@@ -50,10 +50,10 @@ class ParametricPIGNN(torch.nn.Module):
         node_in_channels = 2 + 1 + n_lagged_feat + 1
 
         self.node_encoder = _mlp(node_in_channels, hidden_dim, hidden_dim)
-        self.edge_encoder = _mlp(1, 16, 16)
+        self.edge_encoder = _mlp(1, 32, 32)
 
         self.gnn_layers = nn.ModuleList([
-            GNNLayer(hidden_dim, 16) for _ in range(n_layers)
+            GNNLayer(hidden_dim, 32) for _ in range(n_layers)
         ])
 
         # Output: (zeta, u, v)
