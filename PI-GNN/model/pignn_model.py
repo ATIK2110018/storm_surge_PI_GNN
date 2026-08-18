@@ -131,6 +131,10 @@ class ParametricPIGNN(torch.nn.Module):
 
             # Full node feature vector
             node_feat = torch.cat([xy_feat, depth_t, lagged, mannings_t], dim=1)
+            
+            if self.training:
+                # Add tiny Gaussian noise for regularization
+                node_feat = node_feat + torch.randn_like(node_feat) * 0.02
 
             # Message passing
             h = self.node_encoder(node_feat)

@@ -82,10 +82,10 @@ def train_model():
             w_phys = 0.0
             stage = f"Data-Only (D:{w_data}, BC:{w_bc}, IC:{w_ic})"
         elif epoch <= 20:
-            w_phys = 0.5 * (epoch - 3) / (20 - 3)
+            w_phys = 1.0 * (epoch - 3) / (20 - 3)
             stage = f"Physics Ramp-Up (P:{w_phys:.2f})"
         else:
-            w_phys = 0.5
+            w_phys = 1.0
             stage = f"Full Physics (P:{w_phys:.2f})"
 
         # Use full available steps immediately (no window curriculum)
