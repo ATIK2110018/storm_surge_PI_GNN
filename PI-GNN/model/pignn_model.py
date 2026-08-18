@@ -21,8 +21,10 @@ class GNNLayer(nn.Module):
     """
     def __init__(self, hidden_dim, edge_feat_dim):
         super().__init__()
-        self.message_net = _mlp(2 * hidden_dim + edge_feat_dim, hidden_dim, hidden_dim)
-        self.update_net = _mlp(2 * hidden_dim, hidden_dim, hidden_dim)
+        # Use shallower MLP for messages to save VRAM on O(E) operations
+        self.message_net = _mlp(2 * hidden_dim + edge_feat_dim, hidden_dim, hidden_dim, n_hidden=1)
+        # update_net is O(V) so deeper MLP is fine
+        self.update_net = _mlp(2 * hidden_dim, hidden_dim, hidden_dim, n_hidden=2)
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, h, src, dst, edge_feat):
@@ -40,7 +42,7 @@ class ParametricPIGNN(torch.nn.Module):
     """
     Non-autoregressive PI-GNN for storm surge prediction.
     """
-    def __init__(self, num_nodes, num_forcing_features=6, hidden_dim=64, n_layers=5,
+    def __init__(self, num_nodes, num_forcing_features=6, hidden_dim=64, n_layers=4,
                  n_lags=N_FORCING_LAGS):
         super(ParametricPIGNN, self).__init__()
         self.n_lags = n_lags
@@ -49,11 +51,11 @@ class ParametricPIGNN(torch.nn.Module):
         n_lagged_feat = n_lags * 5
         node_in_channels = 2 + 1 + n_lagged_feat + 1
 
-        self.node_encoder = _mlp(node_in_channels, hidden_dim, hidden_dim)
-        self.edge_encoder = _mlp(1, 32, 32)
+        self.node_encoder = _mlp(node_in_channels, hidden_dim, hidden_dim, n_hidden=2)
+        self.edge_encoder = _mlp(1, 16, 16, n_hidden=2)
 
         self.gnn_layers = nn.ModuleList([
-            GNNLayer(hidden_dim, 32) for _ in range(n_layers)
+            GNNLayer(hidden_dim, 16) for _ in range(n_layers)
         ])
 
         # Output: (zeta, u, v)
