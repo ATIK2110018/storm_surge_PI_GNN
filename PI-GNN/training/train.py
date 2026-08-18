@@ -60,7 +60,7 @@ def train_model():
         true_uvels = true_uvels.to(device)
         true_vvels = true_vvels.to(device)
 
-    optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.97)
 
     # Training indices: model needs N_FORCING_LAGS past steps as context

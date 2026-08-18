@@ -5,11 +5,11 @@ import torch.nn as nn
 N_FORCING_LAGS = 52   # number of lagged forcing snapshots (including current)
 
 
-def _mlp(in_dim, hidden_dim, out_dim, n_hidden=2):
-    """Build a deeper MLP with LayerNorm and SiLU activations."""
-    layers = [nn.Linear(in_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU()]
+def _mlp(in_dim, hidden_dim, out_dim, n_hidden=2, dropout=0.1):
+    """Build a deeper MLP with LayerNorm, SiLU, and Dropout to prevent overfitting."""
+    layers = [nn.Linear(in_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU(), nn.Dropout(dropout)]
     for _ in range(n_hidden - 1):
-        layers += [nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU()]
+        layers += [nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU(), nn.Dropout(dropout)]
     layers.append(nn.Linear(hidden_dim, out_dim))
     return nn.Sequential(*layers)
 
