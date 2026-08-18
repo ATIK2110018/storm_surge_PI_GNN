@@ -24,7 +24,7 @@ def train_model():
             return
 
     # Non-autoregressive setup
-    epochs        = 40
+    epochs        = 80
     learning_rate = 5e-4
 
     print("1. Compiling Full Storm Dataset (Track + Mesh + Boundaries)...")
@@ -78,11 +78,11 @@ def train_model():
         w_bc   = 20.0
         w_ic   = 20.0
         
-        if epoch <= 10:
+        if epoch <= 20:
             w_phys = 0.0
             stage = f"Data-Only (D:{w_data}, BC:{w_bc}, IC:{w_ic})"
-        elif epoch <= 20:
-            w_phys = 0.5 * (epoch - 10) / (20 - 10)
+        elif epoch <= 40:
+            w_phys = 0.5 * (epoch - 20) / (40 - 20)
             stage = f"Physics Ramp-Up (P:{w_phys:.2f})"
         else:
             w_phys = 0.5
@@ -213,10 +213,10 @@ def train_model():
         print(f"  >>> Epoch {epoch} Summary | Avg Data: {avg_epoch_data:.5f} | "
               f"Val Loss: {avg_val:.5f}")
 
-        # Save best checkpoint from epoch 25+
-        if epoch == 25:
+        # Save best checkpoint from epoch 45+
+        if epoch == 45:
             best_loss = float('inf')
-        if epoch >= 25 and avg_epoch_data < best_loss:
+        if epoch >= 45 and avg_epoch_data < best_loss:
             best_loss = avg_epoch_data
             torch.save(model.state_dict(),
                        os.path.join(os.path.dirname(__file__), 'pi_gnn_model_best.pth'))

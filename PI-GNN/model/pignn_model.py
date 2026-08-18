@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 
-# Lag Configuration
-N_FORCING_LAGS = 8   # number of lagged forcing snapshots (including current)
+# Lag Configuration: 24 lags * 15 min = 6 hours of storm history
+N_FORCING_LAGS = 24   # number of lagged forcing snapshots (including current)
 
 
 def _mlp(in_dim, hidden_dim, out_dim, n_hidden=2):
